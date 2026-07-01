@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# VPS Hardening Script v3.0
+# VPS Hardening Script v3.1
 # Supports: Ubuntu 20.04, 22.04, 24.04
 # Providers: Oracle Cloud, AWS, DigitalOcean, Hetzner, Linode, Vultr, generic
 # Usage: sudo ./harden.sh
@@ -25,20 +25,26 @@ DIM='\033[2m'
 ITALIC='\033[3m'
 NC='\033[0m'
 
-# Spinner characters for background tasks
 SPINNER='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 
-log_ok()      { echo -e "  ${GREEN}✓${NC}  $1"; }
-log_warn()    { echo -e "  ${YELLOW}⚠${NC}  $1"; }
-log_error()   { echo -e "  ${RED}✗${NC}  $1"; }
-log_info()    { echo -e "  ${BLUE}ℹ${NC}  $1"; }
-log_step()    { echo -e "  ${CYAN}→${NC}  $1"; }
-log_tip()     { echo -e "  ${MAGENTA}💡${NC} $1"; }
+log_ok()   { echo -e "  ${GREEN}✓${NC}  $1"; }
+log_warn() { echo -e "  ${YELLOW}⚠${NC}  $1"; }
+log_error(){ echo -e "  ${RED}✗${NC}  $1"; }
+log_info() { echo -e "  ${BLUE}ℹ${NC}  $1"; }
+log_step() { echo -e "  ${CYAN}→${NC}  $1"; }
+log_tip()  { echo -e "  ${MAGENTA}💡${NC} $1"; }
 
-# Animated spinner for background operations
+# -----------------------------------------------------------------------------
+# spin() — animated spinner for a background PID
+#
+# Uses a temp file to capture the child's exit code reliably, avoiding the
+# race condition where the process exits before kill -0 is called and the
+# shell has already reaped it (making wait return 127).
+# -----------------------------------------------------------------------------
 spin() {
     local MSG="$1"
     local PID="$2"
+    local EXIT_FILE="$3"   # temp file written by the child wrapper
     local i=0
     local LEN=${#SPINNER}
 
@@ -50,26 +56,46 @@ spin() {
         sleep 0.1
     done
 
-    wait "$PID" 2>/dev/null
-    local EXIT_CODE=$?
+    # Wait so the shell cleans up the zombie; exit code is in EXIT_FILE
+    wait "$PID" 2>/dev/null || true
+    local CODE
+    CODE=$(cat "$EXIT_FILE" 2>/dev/null || echo 1)
     echo -ne "\r"
 
-    if [[ $EXIT_CODE -eq 0 ]]; then
+    if [[ "$CODE" -eq 0 ]]; then
         echo -e "  ${GREEN}✓${NC}  $MSG"
     else
         echo -e "  ${RED}✗${NC}  $MSG ${RED}(failed)${NC}"
     fi
 
-    return $EXIT_CODE
+    return "$CODE"
 }
 
-# Run command silently in background with spinner
+# -----------------------------------------------------------------------------
+# run_silent() — run a command in the background with a spinner
+#
+# The child subshell writes its own exit code to a temp file so spin() can
+# retrieve it without relying on wait's return value (which can be wrong when
+# the process exits before the spin loop starts).
+#
+# With set -e active, a non-zero return here propagates to the caller, which
+# can wrap with "|| true" for recoverable failures or let it abort the script.
+# -----------------------------------------------------------------------------
 run_silent() {
     local MSG="$1"
     shift
-    "$@" > /dev/null 2>&1 &
+    local EXIT_FILE
+    EXIT_FILE=$(mktemp)
+
+    # Subshell: run command, write exit code, always exit 0 so the shell
+    # does not mark the background job as failed before spin() reads the file.
+    ( "$@" > /dev/null 2>&1; echo $? > "$EXIT_FILE" ) &
     local PID=$!
-    spin "$MSG" "$PID"
+
+    spin "$MSG" "$PID" "$EXIT_FILE"
+    local CODE=$?
+    rm -f "$EXIT_FILE"
+    return "$CODE"
 }
 
 print_banner() {
@@ -78,7 +104,7 @@ print_banner() {
     echo -e "${BOLD}${CYAN}"
     echo "  ╔══════════════════════════════════════════════════════════╗"
     echo "  ║                                                          ║"
-    echo "  ║     🛡️   VPS HARDENING SCRIPT  v3.0                     ║"
+    echo "  ║     🛡️   VPS HARDENING SCRIPT  v3.1                     ║"
     echo "  ║     Secure your server in minutes, not hours             ║"
     echo "  ║                                                          ║"
     echo "  ╚══════════════════════════════════════════════════════════╝"
@@ -95,9 +121,7 @@ print_phase() {
     echo ""
     echo -e "  ${BOLD}${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "  ${BOLD}${WHITE}  Phase $NUM${NC}  ${BOLD}$TITLE${NC}"
-    if [[ -n "$DESC" ]]; then
-        echo -e "  ${DIM}  $DESC${NC}"
-    fi
+    [[ -n "$DESC" ]] && echo -e "  ${DIM}  $DESC${NC}"
     echo -e "  ${BOLD}${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
 }
@@ -124,7 +148,10 @@ pause() {
     read -r
 }
 
-# Root check
+# =============================================================================
+# ROOT CHECK
+# =============================================================================
+
 if [[ $EUID -ne 0 ]]; then
     echo ""
     echo -e "  ${RED}✗${NC}  This script requires ${BOLD}root privileges${NC}."
@@ -137,6 +164,9 @@ fi
 # HELPERS
 # =============================================================================
 
+# -----------------------------------------------------------------------------
+# get_public_ip() — tries two well-known endpoints; warns if both fail
+# -----------------------------------------------------------------------------
 get_public_ip() {
     local IP
     if IP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null) && [[ -n "$IP" ]]; then
@@ -144,27 +174,42 @@ get_public_ip() {
     elif IP=$(curl -s --max-time 5 icanhazip.com 2>/dev/null) && [[ -n "$IP" ]]; then
         echo "$IP"
     else
+        # Write the warning to stderr so it does not pollute the return value
+        log_warn "Could not detect public IP — replace YOUR_SERVER_IP in the commands below." >&2
         echo "YOUR_SERVER_IP"
     fi
 }
 
+# -----------------------------------------------------------------------------
+# safe_find_suid() — finds SUID binaries; warns if result is empty
+# (empty baseline in containers would cause permanent false positives)
+# -----------------------------------------------------------------------------
 safe_find_suid() {
-    find / -perm -4000 -type f 2>/dev/null | grep -v snap | sort || true
+    local RESULT
+    RESULT=$(find / -perm -4000 -type f 2>/dev/null | grep -v snap | sort || true)
+    if [[ -z "$RESULT" ]]; then
+        log_warn "SUID scan returned no results — baseline may be unreliable in this environment." >&2
+    fi
+    echo "$RESULT"
 }
 
+# -----------------------------------------------------------------------------
+# apply_ssh_socket_fix() — Ubuntu 24.04 uses socket activation by default;
+# disable it so sshd manages its own port directly.
+# -----------------------------------------------------------------------------
 apply_ssh_socket_fix() {
     local SOCKET_EXISTS=false
-    systemctl list-units --all 2>/dev/null | grep -q "ssh.socket"  && SOCKET_EXISTS=true || true
-    systemctl list-unit-files 2>/dev/null | grep -q "ssh.socket"   && SOCKET_EXISTS=true || true
-    [[ -f /lib/systemd/system/ssh.socket ]]                        && SOCKET_EXISTS=true || true
-    [[ -f /usr/lib/systemd/system/ssh.socket ]]                    && SOCKET_EXISTS=true || true
+    systemctl list-units   --all 2>/dev/null | grep -q "ssh.socket" && SOCKET_EXISTS=true || true
+    systemctl list-unit-files     2>/dev/null | grep -q "ssh.socket" && SOCKET_EXISTS=true || true
+    [[ -f /lib/systemd/system/ssh.socket ]]                          && SOCKET_EXISTS=true || true
+    [[ -f /usr/lib/systemd/system/ssh.socket ]]                      && SOCKET_EXISTS=true || true
 
     if [[ "$SOCKET_EXISTS" == "true" ]]; then
         log_step "Disabling SSH socket activation ${DIM}(Ubuntu 24.04 specific)${NC}"
-        systemctl stop ssh.socket    2>/dev/null || true
+        systemctl stop    ssh.socket 2>/dev/null || true
         systemctl disable ssh.socket 2>/dev/null || true
-        systemctl mask ssh.socket    2>/dev/null || true
-        systemctl enable ssh.service 2>/dev/null || true
+        systemctl mask    ssh.socket 2>/dev/null || true
+        systemctl enable  ssh.service 2>/dev/null || true
         log_ok "Socket activation disabled — sshd controls its own port now"
     fi
 
@@ -174,7 +219,6 @@ apply_ssh_socket_fix() {
     fi
 }
 
-# Calculate elapsed time
 SCRIPT_START=$(date +%s)
 
 # =============================================================================
@@ -205,27 +249,18 @@ echo ""
 pause
 
 # =============================================================================
-# ENVIRONMENT DETECTION
+# PHASE 0a — ENVIRONMENT DETECTION
 # =============================================================================
 
 print_phase "0" "Environment Detection" "Analyzing your server before making changes"
 
-progress_items=(
-    "Reading OS information"
-    "Detecting cloud provider"
-    "Checking firewall rules"
-    "Checking cloud-init"
-    "Scanning installed services"
-)
-
 # --- OS ---
-echo -ne "  ${CYAN}⠋${NC}  ${progress_items[0]}"
-OS_ID=$(grep "^ID=" /etc/os-release | cut -d= -f2 | tr -d '"')
+echo -ne "  ${CYAN}⠋${NC}  Reading OS information"
+OS_ID=$(grep "^ID="           /etc/os-release | cut -d= -f2 | tr -d '"')
 OS_VERSION=$(grep "^VERSION_ID=" /etc/os-release | cut -d= -f2 | tr -d '"')
-OS_CODENAME=$(grep "^VERSION_CODENAME=" /etc/os-release \
-    | cut -d= -f2 | tr -d '"' 2>/dev/null || echo "unknown")
+OS_CODENAME=$(grep "^VERSION_CODENAME=" /etc/os-release | cut -d= -f2 | tr -d '"' 2>/dev/null || echo "unknown")
 sleep 0.3
-echo -e "\r  ${GREEN}✓${NC}  ${progress_items[0]}"
+echo -e "\r  ${GREEN}✓${NC}  Reading OS information"
 
 if [[ "$OS_ID" != "ubuntu" ]]; then
     log_warn "This script is designed for Ubuntu. Detected: $OS_ID"
@@ -233,102 +268,102 @@ if [[ "$OS_ID" != "ubuntu" ]]; then
     [[ "$CONTINUE_ANYWAY" != "yes" ]] && exit 1
 fi
 
-CURRENT_USER="${SUDO_USER:-root}"
+# Resolve the invoking user safely — guard against SUDO_USER being empty string
+CURRENT_USER="${SUDO_USER:-}"
+CURRENT_USER="${CURRENT_USER:-root}"
+[[ -z "$CURRENT_USER" ]] && CURRENT_USER="root"
 
 # --- Cloud Provider ---
-echo -ne "  ${CYAN}⠋${NC}  ${progress_items[1]}"
+echo -ne "  ${CYAN}⠋${NC}  Detecting cloud provider"
 CLOUD_PROVIDER="generic"
 DEFAULT_CLOUD_USER="$CURRENT_USER"
 
-if systemctl list-units --all 2>/dev/null | grep -q "oracle" || \
-   [[ -f /etc/oracle-cloud-agent/agent.yml ]] || \
-   curl -sf --max-time 2 -H "Authorization: Bearer Oracle" \
-       http://169.254.169.254/opc/v2/instance/ &>/dev/null; then
+if systemctl list-units --all 2>/dev/null | grep -q "oracle" \
+   || [[ -f /etc/oracle-cloud-agent/agent.yml ]] \
+   || curl -sf --max-time 2 -H "Authorization: Bearer Oracle" \
+        http://169.254.169.254/opc/v2/instance/ > /dev/null 2>&1; then
     CLOUD_PROVIDER="oracle"; DEFAULT_CLOUD_USER="ubuntu"
-elif curl -sf --max-time 2 http://169.254.169.254/latest/meta-data/ami-id &>/dev/null; then
+elif curl -sf --max-time 2 http://169.254.169.254/latest/meta-data/ami-id > /dev/null 2>&1; then
     CLOUD_PROVIDER="aws"; DEFAULT_CLOUD_USER="ubuntu"
-elif [[ -f /etc/digitalocean ]] || \
-     curl -sf --max-time 2 http://169.254.169.254/metadata/v1/id &>/dev/null; then
+elif [[ -f /etc/digitalocean ]] \
+     || curl -sf --max-time 2 http://169.254.169.254/metadata/v1/id > /dev/null 2>&1; then
     CLOUD_PROVIDER="digitalocean"; DEFAULT_CLOUD_USER="root"
-elif [[ -f /etc/hetzner-build ]] || \
-     curl -sf --max-time 2 http://169.254.169.254/hetzner/v1/metadata &>/dev/null; then
+elif [[ -f /etc/hetzner-build ]] \
+     || curl -sf --max-time 2 http://169.254.169.254/hetzner/v1/metadata > /dev/null 2>&1; then
     CLOUD_PROVIDER="hetzner"; DEFAULT_CLOUD_USER="root"
-elif curl -sf --max-time 2 http://169.254.169.254/linode/v1/ &>/dev/null; then
+elif curl -sf --max-time 2 http://169.254.169.254/linode/v1/ > /dev/null 2>&1; then
     CLOUD_PROVIDER="linode"; DEFAULT_CLOUD_USER="root"
-elif curl -sf --max-time 2 http://169.254.169.254/v1.json &>/dev/null; then
+elif curl -sf --max-time 2 http://169.254.169.254/v1.json > /dev/null 2>&1; then
     CLOUD_PROVIDER="vultr"; DEFAULT_CLOUD_USER="root"
 elif curl -sf --max-time 2 -H "Metadata-Flavor: Google" \
-     http://169.254.169.254/computeMetadata/v1/ &>/dev/null; then
+     http://169.254.169.254/computeMetadata/v1/ > /dev/null 2>&1; then
     CLOUD_PROVIDER="gcp"; DEFAULT_CLOUD_USER="ubuntu"
 elif curl -sf --max-time 2 -H "Metadata: true" \
-     "http://169.254.169.254/metadata/instance?api-version=2021-02-01" &>/dev/null; then
+     "http://169.254.169.254/metadata/instance?api-version=2021-02-01" > /dev/null 2>&1; then
     CLOUD_PROVIDER="azure"; DEFAULT_CLOUD_USER="azureuser"
 fi
 
-if ! id "$DEFAULT_CLOUD_USER" &>/dev/null; then
-    DEFAULT_CLOUD_USER="$CURRENT_USER"
-fi
-echo -e "\r  ${GREEN}✓${NC}  ${progress_items[1]}"
+id "$DEFAULT_CLOUD_USER" > /dev/null 2>&1 || DEFAULT_CLOUD_USER="$CURRENT_USER"
+echo -e "\r  ${GREEN}✓${NC}  Detecting cloud provider"
 
 # --- iptables ---
-echo -ne "  ${CYAN}⠋${NC}  ${progress_items[2]}"
+echo -ne "  ${CYAN}⠋${NC}  Checking firewall rules"
 CONFLICTING_IPTABLES=false
-CONFLICTING_LINES=()
-if command -v iptables &>/dev/null; then
+CONFLICTING_SPECS=()   # store rule specs, not line numbers (safer deletion)
+if command -v iptables > /dev/null 2>&1; then
     while IFS= read -r line; do
-        if echo "$line" | grep -qE "REJECT|DROP" && \
-           echo "$line" | grep -qE "^[0-9]"; then
-            LINE_NUM=$(echo "$line" | awk '{print $1}')
-            CONFLICTING_LINES+=("$LINE_NUM")
+        if echo "$line" | grep -qE "REJECT|DROP"; then
+            # Extract everything after the line number — that is the rule spec
+            RULE_SPEC=$(echo "$line" | awk '{$1=""; print $0}' | xargs)
+            CONFLICTING_SPECS+=("$RULE_SPEC")
             CONFLICTING_IPTABLES=true
         fi
     done < <(iptables -L INPUT -n --line-numbers 2>/dev/null | tail -n +3)
 fi
-echo -e "\r  ${GREEN}✓${NC}  ${progress_items[2]}"
+echo -e "\r  ${GREEN}✓${NC}  Checking firewall rules"
 
 # --- cloud-init ---
-echo -ne "  ${CYAN}⠋${NC}  ${progress_items[3]}"
+echo -ne "  ${CYAN}⠋${NC}  Checking cloud-init"
 HAS_CLOUD_INIT=false
-command -v cloud-init &>/dev/null && HAS_CLOUD_INIT=true
-echo -e "\r  ${GREEN}✓${NC}  ${progress_items[3]}"
+command -v cloud-init > /dev/null 2>&1 && HAS_CLOUD_INIT=true
+echo -e "\r  ${GREEN}✓${NC}  Checking cloud-init"
 
 # --- Services ---
-echo -ne "  ${CYAN}⠋${NC}  ${progress_items[4]}"
+echo -ne "  ${CYAN}⠋${NC}  Scanning installed services"
 HAS_RPCBIND=false; HAS_MODEMMANAGER=false; HAS_ISCSID=false
 systemctl list-units --all 2>/dev/null | grep -q "rpcbind"      && HAS_RPCBIND=true      || true
 systemctl list-units --all 2>/dev/null | grep -q "ModemManager" && HAS_MODEMMANAGER=true  || true
 systemctl list-units --all 2>/dev/null | grep -q "iscsid"       && HAS_ISCSID=true        || true
-echo -e "\r  ${GREEN}✓${NC}  ${progress_items[4]}"
+echo -e "\r  ${GREEN}✓${NC}  Scanning installed services"
 
-# --- Results Table ---
+# --- Results ---
 print_divider
-
 echo -e "  ${BOLD}Your Server:${NC}"
 echo ""
 echo -e "    ${DIM}Operating System${NC}    $OS_ID $OS_VERSION ($OS_CODENAME)"
 echo -e "    ${DIM}Cloud Provider${NC}      $CLOUD_PROVIDER"
 echo -e "    ${DIM}Logged in as${NC}        $CURRENT_USER"
 echo -e "    ${DIM}Cloud default user${NC}  $DEFAULT_CLOUD_USER"
-echo -e "    ${DIM}cloud-init${NC}          $(if [[ "$HAS_CLOUD_INIT" == "true" ]]; then echo "${GREEN}present${NC}"; else echo "${DIM}not found${NC}"; fi)"
-echo -e "    ${DIM}iptables${NC}            $(if [[ "$CONFLICTING_IPTABLES" == "true" ]]; then echo "${YELLOW}conflicts found (will fix)${NC}"; else echo "${GREEN}clean${NC}"; fi)"
+echo -e "    ${DIM}cloud-init${NC}          $( [[ "$HAS_CLOUD_INIT" == "true" ]] && echo "${GREEN}present${NC}" || echo "${DIM}not found${NC}" )"
+echo -e "    ${DIM}iptables${NC}            $( [[ "$CONFLICTING_IPTABLES" == "true" ]] && echo "${YELLOW}conflicts found (will fix)${NC}" || echo "${GREEN}clean${NC}" )"
 
-# Count services to remove
 SVC_COUNT=0
-[[ "$HAS_RPCBIND" == "true" ]] && SVC_COUNT=$((SVC_COUNT+1))
+[[ "$HAS_RPCBIND"      == "true" ]] && SVC_COUNT=$((SVC_COUNT+1))
 [[ "$HAS_MODEMMANAGER" == "true" ]] && SVC_COUNT=$((SVC_COUNT+1))
-[[ "$HAS_ISCSID" == "true" ]] && SVC_COUNT=$((SVC_COUNT+1))
+[[ "$HAS_ISCSID"       == "true" ]] && SVC_COUNT=$((SVC_COUNT+1))
 echo -e "    ${DIM}Services to remove${NC}  ${SVC_COUNT} found"
-
 echo ""
 log_ok "Environment scan complete"
 
 # =============================================================================
-# CONFIGURATION
+# PHASE 0b — CONFIGURATION
 # =============================================================================
 
 print_phase "0" "Configuration" "Tell me how you want your server set up"
 
-# --- Auth Method ---
+# ---------------------------------------------------------------------------
+# Auth method
+# ---------------------------------------------------------------------------
 print_divider
 echo -e "  ${BOLD}🔐 Authentication Method${NC}"
 echo ""
@@ -336,7 +371,6 @@ echo -e "    ${CYAN}1)${NC}  SSH key  ${DIM}(private key / identity file)${NC}"
 echo -e "    ${CYAN}2)${NC}  Password"
 echo ""
 read -rp "  How are you logged in? (1/2): " AUTH_METHOD
-
 while [[ "$AUTH_METHOD" != "1" && "$AUTH_METHOD" != "2" ]]; do
     log_warn "Please enter 1 or 2."
     read -rp "  Enter 1 or 2: " AUTH_METHOD
@@ -347,35 +381,39 @@ INPUT_PUBLIC_KEY=""
 
 if [[ "$AUTH_METHOD" == "1" ]]; then
     AUTH_TYPE="key"
-    echo ""
-    log_ok "SSH key authentication"
+    log_ok "SSH key authentication selected"
 
-    CURRENT_USER_HOME=$(eval echo "~${SUDO_USER:-$USER}")
+    # Check both the invoking user's home and root's home — both with
+    # properly quoted paths (fixes the syntax error on line 359).
+    CURRENT_USER_HOME=$(eval echo "~${CURRENT_USER}")
     KEY_FOUND=false
-    if [[ -f "$CURRENT_USER_HOME/.ssh/authorized_keys" ]] && \
-       [[ -s "$CURRENT_USER_HOME/.ssh/authorized_keys" ]]; then
-        log_ok "Found authorized_keys"
+
+    if [[ -f "$CURRENT_USER_HOME/.ssh/authorized_keys" ]] \
+       && [[ -s "$CURRENT_USER_HOME/.ssh/authorized_keys" ]]; then
+        log_ok "Found authorized_keys in $CURRENT_USER_HOME/.ssh/"
         KEY_FOUND=true
-    elif [[ -f /root/.ssh/authorized_keys" ]] && \
-         [[ -s "/root/.ssh/authorized_keys" ]]; then
-        log_ok "Found authorized_keys"
+    elif [[ -f "/root/.ssh/authorized_keys" ]] \
+         && [[ -s "/root/.ssh/authorized_keys" ]]; then
+        log_ok "Found authorized_keys in /root/.ssh/"
         KEY_FOUND=true
     fi
 
     if [[ "$KEY_FOUND" == "false" ]]; then
-        log_warn "No authorized_keys found"
+        log_warn "No authorized_keys file found."
         read -rp "  Continue anyway? (yes/no): " KEY_CONFIRM
         [[ "$KEY_CONFIRM" != "yes" ]] && exit 1
     fi
 
 else
+    # -----------------------------------------------------------------------
+    # Password path — offer to upgrade to SSH key
+    # -----------------------------------------------------------------------
     print_box "SSH KEY RECOMMENDATION" "$YELLOW"
     echo -e "  SSH keys are ${BOLD}far more secure${NC} than passwords:"
     echo ""
     echo -e "    ${YELLOW}•${NC}  Passwords can be brute-forced — keys ${BOLD}cannot${NC}"
     echo -e "    ${YELLOW}•${NC}  Keys use 256+ bits of cryptographic randomness"
-    echo -e "    ${YELLOW}•${NC}  Automated bots are trying passwords on your"
-    echo -e "       server ${ITALIC}right now${NC}"
+    echo -e "    ${YELLOW}•${NC}  Automated bots are trying passwords on your server ${ITALIC}right now${NC}"
     echo -e "    ${YELLOW}•${NC}  fail2ban will be installed either way to limit attempts"
     echo ""
     print_divider
@@ -385,7 +423,6 @@ else
     echo -e "    ${CYAN}b)${NC}  No  — keep using password"
     echo ""
     read -rp "  Enter a or b: " KEY_CHOICE
-
     while [[ "$KEY_CHOICE" != "a" && "$KEY_CHOICE" != "b" ]]; do
         log_warn "Please enter a or b."
         read -rp "  Enter a or b: " KEY_CHOICE
@@ -406,7 +443,6 @@ else
         echo ""
         echo -e "  ${BOLD}Step 2${NC} — Copy the output (starts with ${CYAN}ssh-ed25519 AAAA...${NC})"
         echo ""
-
         read -rp "  Have you generated the key? (yes/no): " KEY_GENERATED
         if [[ "$KEY_GENERATED" != "yes" ]]; then
             log_warn "Generate a key first, then re-run this script."
@@ -417,27 +453,26 @@ else
         echo -e "  ${BOLD}Step 3${NC} — Paste your ${BOLD}public key${NC} (.pub file):"
         echo ""
         read -rp "  > " INPUT_PUBLIC_KEY
-
         while [[ ! "$INPUT_PUBLIC_KEY" =~ ^ssh-(ed25519|rsa|ecdsa) ]]; do
             echo ""
-            log_warn "Invalid format. Must start with ssh-ed25519, ssh-rsa, or ssh-ecdsa"
-            log_warn "Make sure you copied the .pub file, not the private key"
+            log_warn "Invalid format. Must start with ssh-ed25519, ssh-rsa, or ssh-ecdsa."
+            log_warn "Make sure you copied the .pub file, not the private key."
             echo ""
             read -rp "  Paste your public key: " INPUT_PUBLIC_KEY
         done
 
+        # Install the key for the current user
         if [[ "$CURRENT_USER" == "root" ]]; then
             KEY_DIR="/root/.ssh"
         else
             KEY_DIR="/home/$CURRENT_USER/.ssh"
         fi
-
         mkdir -p "$KEY_DIR"
         chmod 700 "$KEY_DIR"
         echo "$INPUT_PUBLIC_KEY" >> "$KEY_DIR/authorized_keys"
         chmod 600 "$KEY_DIR/authorized_keys"
         [[ "$CURRENT_USER" != "root" ]] && chown -R "$CURRENT_USER:$CURRENT_USER" "$KEY_DIR"
-        log_ok "Public key installed"
+        log_ok "Public key installed for $CURRENT_USER"
 
         PUBLIC_IP_EARLY=$(get_public_ip)
         print_box "TEST YOUR KEY LOGIN NOW" "$YELLOW"
@@ -455,7 +490,6 @@ else
         read -rp "  Did the SSH key login succeed? (yes/no): " KEY_TEST
 
         if [[ "$KEY_TEST" != "yes" ]]; then
-            echo ""
             log_warn "Key login failed. Tips:"
             echo -e "    ${CYAN}1)${NC} Confirm you copied the .pub file (public key)"
             echo -e "    ${CYAN}2)${NC} Check: ${CYAN}cat $KEY_DIR/authorized_keys${NC}"
@@ -464,7 +498,7 @@ else
             read -rp "  Continue with password-only instead? (yes/no): " FALLBACK
             if [[ "$FALLBACK" == "yes" ]]; then
                 AUTH_TYPE="password"
-                log_warn "Switching to password authentication"
+                log_warn "Switching to password authentication."
             else
                 log_error "Fix the key issue and re-run this script."
                 exit 1
@@ -474,13 +508,14 @@ else
         fi
     else
         AUTH_TYPE="password"
-        echo ""
-        log_info "Continuing with password authentication"
-        log_tip "You can add SSH keys later for stronger security"
+        log_info "Continuing with password authentication."
+        log_tip "You can add SSH keys later for stronger security."
     fi
 fi
 
-# --- Hostname ---
+# ---------------------------------------------------------------------------
+# Hostname
+# ---------------------------------------------------------------------------
 print_divider
 echo -e "  ${BOLD}🏷️  Server Hostname${NC}"
 echo -e "  ${DIM}A meaningful name for this server (letters, numbers, hyphens)${NC}"
@@ -491,33 +526,50 @@ while [[ -z "$INPUT_HOSTNAME" || ! "$INPUT_HOSTNAME" =~ ^[a-zA-Z0-9-]+$ ]]; do
     read -rp "  Hostname: " INPUT_HOSTNAME
 done
 
-# --- SSH Port ---
+# ---------------------------------------------------------------------------
+# SSH Port
+# ---------------------------------------------------------------------------
 print_divider
 echo -e "  ${BOLD}🔌 New SSH Port${NC}"
 echo -e "  ${DIM}Moving SSH off port 22 blocks most automated scanners.${NC}"
 echo -e "  ${DIM}Pick any number 1024–65535. Avoid 2222 (bots scan that too).${NC}"
 echo ""
 read -rp "  SSH port (e.g., 7022, 30044, 45678): " INPUT_SSH_PORT
-while ! [[ "$INPUT_SSH_PORT" =~ ^[0-9]+$ ]] || \
-      [[ "$INPUT_SSH_PORT" -lt 1024 ]] || \
-      [[ "$INPUT_SSH_PORT" -gt 65535 ]]; do
+while ! [[ "$INPUT_SSH_PORT" =~ ^[0-9]+$ ]] \
+      || [[ "$INPUT_SSH_PORT" -lt 1024 ]] \
+      || [[ "$INPUT_SSH_PORT" -gt 65535 ]]; do
     log_warn "Invalid. Must be 1024–65535."
     read -rp "  SSH port: " INPUT_SSH_PORT
 done
 
-# --- Admin Username ---
+# ---------------------------------------------------------------------------
+# Admin username — allowlist validation + expanded blocklist
+# ---------------------------------------------------------------------------
 print_divider
 echo -e "  ${BOLD}👤 Admin Username${NC}"
-echo -e "  ${DIM}Your personal admin account. Avoid: ubuntu, admin, root, test, user${NC}"
+echo -e "  ${DIM}Your personal admin account.${NC}"
+echo -e "  ${DIM}Avoid common names: ubuntu, admin, root, test, user, deploy, git, pi${NC}"
 echo ""
+
+BLOCKED_NAMES="ubuntu admin root test user deploy git ansible pi postgres ec2-user centos fedora"
+
 read -rp "  Username: " INPUT_USERNAME
-while [[ -z "$INPUT_USERNAME" || \
-         "$INPUT_USERNAME" =~ ^(ubuntu|admin|root|test|user)$ ]]; do
-    log_warn "Too predictable. Choose something unique."
+while true; do
+    if [[ -z "$INPUT_USERNAME" ]]; then
+        log_warn "Username cannot be empty."
+    elif [[ ! "$INPUT_USERNAME" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+        log_warn "Must start with a lowercase letter or underscore, max 32 chars, lowercase only."
+    elif echo "$BLOCKED_NAMES" | grep -qw "$INPUT_USERNAME"; then
+        log_warn "Too predictable. Choose something unique."
+    else
+        break
+    fi
     read -rp "  Username: " INPUT_USERNAME
 done
 
-# --- Cloud User ---
+# ---------------------------------------------------------------------------
+# Cloud user to demote
+# ---------------------------------------------------------------------------
 INPUT_CLOUD_USER="$CURRENT_USER"
 if [[ "$CURRENT_USER" != "root" ]]; then
     print_divider
@@ -527,7 +579,9 @@ if [[ "$CURRENT_USER" != "root" ]]; then
     INPUT_CLOUD_USER="${INPUT_CLOUD_USER:-$CURRENT_USER}"
 fi
 
-# --- Confirmation ---
+# ---------------------------------------------------------------------------
+# Confirmation
+# ---------------------------------------------------------------------------
 echo ""
 echo -e "  ${BOLD}${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
 echo -e "  ${BOLD}${CYAN}║${NC}  ${BOLD}${WHITE}CONFIGURATION SUMMARY${NC}"
@@ -550,28 +604,26 @@ fi
 echo ""
 read -rp "  Proceed with these settings? (yes/no): " CONFIRM
 if [[ "$CONFIRM" != "yes" ]]; then
-    echo ""
     log_warn "Aborted. No changes were made."
-    echo ""
     exit 1
 fi
 
 # =============================================================================
-# LOGGING
+# LOGGING — tee to file from here onward
 # =============================================================================
 
 LOGFILE="/var/log/harden-script.log"
 exec > >(tee -a "$LOGFILE") 2>&1
 {
     echo "════════════════════════════════════════"
-    echo "Started: $(date)"
+    echo "Started : $(date)"
     echo "Provider: $CLOUD_PROVIDER | OS: $OS_ID $OS_VERSION | Auth: $AUTH_TYPE"
-    echo "Host: $INPUT_HOSTNAME | Port: $INPUT_SSH_PORT | User: $INPUT_USERNAME"
+    echo "Host    : $INPUT_HOSTNAME | Port: $INPUT_SSH_PORT | User: $INPUT_USERNAME"
     echo "════════════════════════════════════════"
 } >> "$LOGFILE"
 
 # =============================================================================
-# PHASE 1 - ASSESSMENT
+# PHASE 1 — ASSESSMENT
 # =============================================================================
 
 print_phase "1" "Initial Assessment" "Quick snapshot of your server's current state"
@@ -597,31 +649,26 @@ while IFS= read -r line; do
 done < <(ss -tlnp | grep LISTEN)
 
 echo ""
-echo -e "  ${BOLD}Services Running:${NC} $(systemctl list-units --type=service --state=running --no-pager 2>/dev/null | grep 'loaded units' | awk '{print $1}')"
+echo -e "  ${BOLD}Running Services:${NC} $(systemctl list-units --type=service --state=running --no-pager 2>/dev/null | grep -c "\.service" || echo "unknown")"
 
-# Kernel check
-RUNNING_KERNEL=$(uname -r)
-if [[ -f /var/run/reboot-required ]]; then
-    echo ""
-    log_warn "A system reboot is pending — will remind you at the end"
-fi
+[[ -f /var/run/reboot-required ]] && log_warn "A system reboot is pending — will remind you at the end."
 
 echo ""
 log_ok "Assessment complete"
 pause
 
 # =============================================================================
-# PHASE 2 - SYSTEM PREP
+# PHASE 2 — SYSTEM PREPARATION
 # =============================================================================
 
 print_phase "2" "System Preparation" "Updating packages and setting hostname"
 
-run_silent "Updating package lists" apt update -qq
+run_silent "Updating package lists"       apt update -qq
 run_silent "Installing available upgrades" apt upgrade -y -qq
-run_silent "Setting hostname to ${BOLD}$INPUT_HOSTNAME${NC}" hostnamectl set-hostname "$INPUT_HOSTNAME"
+run_silent "Setting hostname to $INPUT_HOSTNAME" hostnamectl set-hostname "$INPUT_HOSTNAME"
 
 if [[ "$HAS_CLOUD_INIT" == "true" ]]; then
-    echo "preserve_hostname: true" > /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg 2>/dev/null
+    echo "preserve_hostname: true" > /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg 2>/dev/null || true
     log_ok "cloud-init hostname lock applied"
 fi
 
@@ -631,37 +678,40 @@ else
     echo "127.0.1.1 $INPUT_HOSTNAME" >> /etc/hosts
 fi
 
-echo ""
 log_ok "System updated, hostname set to ${BOLD}$INPUT_HOSTNAME${NC}"
 
 # =============================================================================
-# PHASE 3 - SERVICES
+# PHASE 3 — SERVICES
 # =============================================================================
 
 print_phase "3" "Remove Unnecessary Services" "Each service is a potential attack target"
 
-disable_and_mask() {
-    local SERVICE="$1"
-    if systemctl list-units --all 2>/dev/null | grep -q "$SERVICE"; then
-        systemctl stop "$SERVICE"    2>/dev/null || true
-        systemctl disable "$SERVICE" 2>/dev/null || true
-        systemctl mask "$SERVICE"    2>/dev/null || true
-        return 0
-    fi
-    return 1
-}
-
 REMOVED=0
+
 if [[ "$HAS_RPCBIND" == "true" ]]; then
-    run_silent "Removing rpcbind (NFS — not needed)" bash -c 'systemctl stop rpcbind.socket rpcbind.service 2>/dev/null; systemctl disable rpcbind.socket rpcbind.service 2>/dev/null; systemctl mask rpcbind.socket rpcbind.service 2>/dev/null; true'
+    run_silent "Removing rpcbind (NFS — not needed on a VPS)" bash -c '
+        systemctl stop    rpcbind.socket rpcbind.service 2>/dev/null || true
+        systemctl disable rpcbind.socket rpcbind.service 2>/dev/null || true
+        systemctl mask    rpcbind.socket rpcbind.service 2>/dev/null || true
+    '
     REMOVED=$((REMOVED+1))
 fi
+
 if [[ "$HAS_MODEMMANAGER" == "true" ]]; then
-    run_silent "Removing ModemManager (cellular — useless on VPS)" bash -c 'systemctl stop ModemManager 2>/dev/null; systemctl disable ModemManager 2>/dev/null; systemctl mask ModemManager 2>/dev/null; true'
+    run_silent "Removing ModemManager (cellular — useless on VPS)" bash -c '
+        systemctl stop    ModemManager 2>/dev/null || true
+        systemctl disable ModemManager 2>/dev/null || true
+        systemctl mask    ModemManager 2>/dev/null || true
+    '
     REMOVED=$((REMOVED+1))
 fi
+
 if [[ "$HAS_ISCSID" == "true" ]]; then
-    run_silent "Removing iSCSI (enterprise storage — not needed)" bash -c 'systemctl stop iscsid.socket iscsid.service 2>/dev/null; systemctl disable iscsid.socket iscsid.service 2>/dev/null; systemctl mask iscsid.socket iscsid.service 2>/dev/null; true'
+    run_silent "Removing iSCSI (enterprise storage — not needed)" bash -c '
+        systemctl stop    iscsid.socket iscsid.service 2>/dev/null || true
+        systemctl disable iscsid.socket iscsid.service 2>/dev/null || true
+        systemctl mask    iscsid.socket iscsid.service 2>/dev/null || true
+    '
     REMOVED=$((REMOVED+1))
 fi
 
@@ -675,31 +725,35 @@ else
 fi
 
 # =============================================================================
-# PHASE 4 - FIREWALL
+# PHASE 4 — FIREWALL
 # =============================================================================
 
 print_phase "4" "Firewall Configuration" "Only allow what you explicitly permit"
 
 run_silent "Installing UFW firewall" apt install ufw -y -qq
 
-ufw default deny incoming > /dev/null 2>&1
+ufw default deny incoming  > /dev/null 2>&1
 ufw default allow outgoing > /dev/null 2>&1
 log_ok "Default policy: ${BOLD}deny incoming${NC}, allow outgoing"
 
-ufw allow 22/tcp comment "SSH default - temporary" > /dev/null 2>&1
-ufw allow "$INPUT_SSH_PORT"/tcp comment "SSH hardened" > /dev/null 2>&1
-log_ok "Opened ports: 22 ${DIM}(temporary)${NC} and ${BOLD}$INPUT_SSH_PORT${NC}"
+# Port 22 stays open here as a safety net.
+# It is removed AFTER Phase 10 account confirmation (not in Phase 5).
+ufw allow 22/tcp              comment "SSH default - safety net" > /dev/null 2>&1
+ufw allow "$INPUT_SSH_PORT"/tcp comment "SSH hardened"            > /dev/null 2>&1
+log_ok "Opened ports: 22 ${DIM}(safety net — closed after account confirmed)${NC} and ${BOLD}$INPUT_SSH_PORT${NC}"
 
 echo "y" | ufw enable > /dev/null 2>&1
 log_ok "UFW firewall ${BOLD}${GREEN}active${NC}"
 
+# Delete conflicting iptables rules by rule spec (not line number) to avoid
+# deleting the wrong rule if the table changed between detection and deletion.
 if [[ "$CONFLICTING_IPTABLES" == "true" ]]; then
-    mapfile -t SORTED_LINES < <(printf '%s\n' "${CONFLICTING_LINES[@]}" | sort -rn)
-    for LINE_NUM in "${SORTED_LINES[@]}"; do
-        iptables -D INPUT "$LINE_NUM" 2>/dev/null || true
+    for SPEC in "${CONFLICTING_SPECS[@]}"; do
+        # shellcheck disable=SC2086  # word-splitting is intentional here
+        iptables -D INPUT $SPEC 2>/dev/null || true
     done
     mkdir -p /etc/iptables
-    sh -c 'iptables-save > /etc/iptables/rules.v4' 2>/dev/null
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
     log_ok "Conflicting iptables rules cleaned"
 fi
 
@@ -724,25 +778,28 @@ case "$CLOUD_PROVIDER" in
 esac
 
 # =============================================================================
-# PHASE 5 - SSH
+# PHASE 5 — SSH HARDENING (safe config — no user restrictions yet)
 # =============================================================================
 
 print_phase "5" "SSH Hardening" "Port change + security settings (no lockout risk)"
 
 echo -e "  ${DIM}This phase changes the port and applies hardening settings.${NC}"
-echo -e "  ${DIM}User restrictions (AllowUsers, root login) are applied${NC}"
-echo -e "  ${DIM}in Phase 10 — only after your new account is confirmed.${NC}"
+echo -e "  ${DIM}AllowUsers and PermitRootLogin no are applied in Phase 10,${NC}"
+echo -e "  ${DIM}only after your new account is confirmed working.${NC}"
+echo -e "  ${DIM}Port 22 stays open until Phase 10 completes.${NC}"
 echo ""
-log_warn "Keep your current SSH session open"
+log_warn "Keep your current SSH session open throughout."
 pause
 
-run_silent "Backing up SSH configuration" bash -c "cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup; mkdir -p /etc/ssh/sshd_config.d"
+run_silent "Backing up SSH configuration" bash -c "
+    cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
+    mkdir -p /etc/ssh/sshd_config.d
+"
 
-# Build SSH config
 if [[ "$AUTH_TYPE" == "key" ]]; then
     cat > /etc/ssh/sshd_config.d/99-hardened.conf << EOF
-# Hardened SSH — Phase 5 (safe)
-# AllowUsers + PermitRootLogin no applied in Phase 10
+# Hardened SSH — Phase 5 (safe, no user restrictions yet)
+# AllowUsers + PermitRootLogin no are applied in Phase 10.
 Port $INPUT_SSH_PORT
 PermitRootLogin yes
 PasswordAuthentication no
@@ -758,8 +815,8 @@ PermitUserEnvironment no
 EOF
 else
     cat > /etc/ssh/sshd_config.d/99-hardened.conf << EOF
-# Hardened SSH — Phase 5 (safe)
-# AllowUsers + PermitRootLogin no applied in Phase 10
+# Hardened SSH — Phase 5 (safe, no user restrictions yet)
+# AllowUsers + PermitRootLogin no are applied in Phase 10.
 Port $INPUT_SSH_PORT
 PermitRootLogin yes
 PasswordAuthentication yes
@@ -778,24 +835,33 @@ log_ok "Hardened SSH config written"
 [[ "$OS_VERSION" == "24.04" ]] && apply_ssh_socket_fix
 
 if ! sshd -t 2>/dev/null; then
-    log_error "SSH config has errors — restoring backup"
+    log_error "SSH config syntax error — restoring backup"
     cp /etc/ssh/sshd_config.backup /etc/ssh/sshd_config
     rm -f /etc/ssh/sshd_config.d/99-hardened.conf
     exit 1
 fi
 
 run_silent "Restarting SSH on port $INPUT_SSH_PORT" systemctl restart ssh
-sleep 1
 
-if ! ss -tlnp | grep -q ":$INPUT_SSH_PORT"; then
-    log_error "SSH is NOT on port $INPUT_SSH_PORT — check journalctl -u ssh"
+# Poll until SSH is confirmed listening — avoids the fixed sleep 1 race
+SSH_UP=false
+for _i in {1..20}; do
+    if ss -tlnp | grep -q ":$INPUT_SSH_PORT"; then
+        SSH_UP=true
+        break
+    fi
+    sleep 0.5
+done
+
+if [[ "$SSH_UP" == "false" ]]; then
+    log_error "SSH is NOT listening on port $INPUT_SSH_PORT after 10 seconds."
+    log_info  "Check: journalctl -u ssh -n 30"
     exit 1
 fi
-
 log_ok "SSH listening on port ${BOLD}$INPUT_SSH_PORT${NC}"
 
 print_box "TEST YOUR CONNECTION" "$YELLOW"
-echo -e "  Open a ${BOLD}NEW terminal${NC} and run:"
+echo -e "  Open a ${BOLD}NEW terminal${NC} and connect on the NEW port:"
 echo ""
 if [[ "$AUTH_TYPE" == "key" ]]; then
     echo -e "    ${CYAN}ssh -i /path/to/key -p $INPUT_SSH_PORT $CURRENT_USER@$PUBLIC_IP${NC}"
@@ -808,17 +874,16 @@ echo ""
 read -rp "  Connection on port $INPUT_SSH_PORT succeeded? (yes/no): " SSH_TEST
 
 if [[ "$SSH_TEST" != "yes" ]]; then
-    log_error "SSH test failed. Debug from this session:"
-    log_info "  systemctl status ssh"
-    log_info "  journalctl -u ssh -n 30"
+    log_error "SSH test failed. Diagnose from this session:"
+    log_info  "  systemctl status ssh"
+    log_info  "  journalctl -u ssh -n 30"
     exit 1
 fi
 
-ufw delete allow 22/tcp > /dev/null 2>&1
-log_ok "Port 22 closed — only ${BOLD}$INPUT_SSH_PORT${NC} is accessible"
+log_ok "Port $INPUT_SSH_PORT confirmed — port 22 stays open until Phase 10"
 
 # =============================================================================
-# PHASE 6 - FAIL2BAN
+# PHASE 6 — FAIL2BAN
 # =============================================================================
 
 print_phase "6" "Brute Force Protection" "fail2ban blocks attackers after 3 failures"
@@ -843,33 +908,31 @@ run_silent "Starting fail2ban" systemctl start fail2ban
 
 BANNED=$(fail2ban-client status sshd 2>/dev/null | grep "Currently banned" | awk '{print $NF}' || echo "0")
 echo ""
-log_ok "fail2ban active — 3 strikes = 24h ban"
-if [[ "$BANNED" -gt 0 ]]; then
-    log_info "Already banned: ${BOLD}$BANNED IP(s)${NC} from previous attacks"
-fi
+log_ok "fail2ban active — 3 strikes = 24 h ban"
+[[ "$BANNED" -gt 0 ]] && log_info "Already banned: ${BOLD}$BANNED IP(s)${NC} from previous attacks"
 
 # =============================================================================
-# PHASE 7 - APPARMOR
+# PHASE 7 — APPARMOR
 # =============================================================================
 
 print_phase "7" "Mandatory Access Control" "AppArmor limits what programs can do, even as root"
 
-if command -v aa-status &>/dev/null; then
+if command -v aa-status > /dev/null 2>&1; then
     PROFILES_BEFORE=$(aa-status 2>/dev/null | grep "profiles are loaded" | awk '{print $1}' || echo "0")
-    run_silent "Installing additional AppArmor profiles" apt install apparmor-profiles apparmor-profiles-extra -y -qq
+    run_silent "Installing additional AppArmor profiles" \
+        apt install apparmor-profiles apparmor-profiles-extra -y -qq
     PROFILES_AFTER=$(aa-status 2>/dev/null | grep "profiles are loaded" | awk '{print $1}' || echo "0")
     ENFORCED=$(aa-status 2>/dev/null | grep "in enforce mode" | head -1 | awk '{print $1}' || echo "0")
     echo ""
     log_ok "AppArmor: ${BOLD}$PROFILES_AFTER${NC} profiles loaded, ${BOLD}$ENFORCED${NC} enforcing"
-    if [[ "$PROFILES_AFTER" -gt "$PROFILES_BEFORE" ]]; then
-        log_info "Added $((PROFILES_AFTER - PROFILES_BEFORE)) new security profiles"
-    fi
+    [[ "$PROFILES_AFTER" -gt "$PROFILES_BEFORE" ]] \
+        && log_info "Added $((PROFILES_AFTER - PROFILES_BEFORE)) new security profiles"
 else
     log_warn "AppArmor not available — skipping"
 fi
 
 # =============================================================================
-# PHASE 8 - LOGGING
+# PHASE 8 — PERSISTENT LOGGING
 # =============================================================================
 
 print_phase "8" "Persistent Logging" "Logs survive reboots — attackers can't erase evidence"
@@ -893,16 +956,14 @@ echo ""
 log_ok "Persistent logging enabled — ${BOLD}${JOURNAL_SIZE}${NC} stored, $BOOT_COUNT boot(s) recorded"
 
 # =============================================================================
-# PHASE 9 - PACKAGES
+# PHASE 9 — PACKAGE CLEANUP
 # =============================================================================
 
 print_phase "9" "Package Cleanup" "Less software = fewer vulnerabilities"
 
 PACKAGES_TO_REMOVE=()
 for PKG in nfs-common open-iscsi ssh-import-id; do
-    if dpkg -l "$PKG" 2>/dev/null | grep -q "^ii"; then
-        PACKAGES_TO_REMOVE+=("$PKG")
-    fi
+    dpkg -l "$PKG" 2>/dev/null | grep -q "^ii" && PACKAGES_TO_REMOVE+=("$PKG")
 done
 
 if [[ ${#PACKAGES_TO_REMOVE[@]} -gt 0 ]]; then
@@ -915,18 +976,18 @@ echo ""
 log_ok "Package cleanup complete — ${#PACKAGES_TO_REMOVE[@]} package(s) removed"
 
 # =============================================================================
-# PHASE 10 - ADMIN ACCOUNT + LOCKDOWN
+# PHASE 10 — ADMIN ACCOUNT + FINAL LOCKDOWN
 # =============================================================================
 
 print_phase "10" "Admin Account + Final Lockdown" "Create your account, then lock everything down"
 
 echo -e "  ${DIM}Your personal admin account is created first.${NC}"
 echo -e "  ${DIM}SSH restrictions are applied ONLY after you confirm it works.${NC}"
-echo -e "  ${DIM}If something goes wrong, root access is preserved.${NC}"
+echo -e "  ${DIM}Port 22 is closed and root login disabled in this phase.${NC}"
 echo ""
 
-# Create account
-if id "$INPUT_USERNAME" &>/dev/null; then
+# --- Create account ---
+if id "$INPUT_USERNAME" > /dev/null 2>&1; then
     log_warn "User $INPUT_USERNAME already exists — skipping creation"
 else
     echo -e "  ${BOLD}Create password for ${GREEN}$INPUT_USERNAME${NC}${BOLD}:${NC}"
@@ -935,42 +996,57 @@ else
 fi
 
 echo ""
-run_silent "Adding $INPUT_USERNAME to sudo and adm groups" bash -c "usermod -aG sudo $INPUT_USERNAME; usermod -aG adm $INPUT_USERNAME"
+run_silent "Adding $INPUT_USERNAME to sudo and adm groups" bash -c "
+    usermod -aG sudo $INPUT_USERNAME
+    usermod -aG adm  $INPUT_USERNAME
+"
 
-# SSH key setup for new account
+# --- SSH key setup for the new account ---
 mkdir -p "/home/$INPUT_USERNAME/.ssh"
 chmod 700 "/home/$INPUT_USERNAME/.ssh"
 
 if [[ "$AUTH_TYPE" == "key" ]]; then
-    KEY_SOURCE=""
-    [[ -f "/root/.ssh/authorized_keys" && -s "/root/.ssh/authorized_keys" ]] && KEY_SOURCE="/root/.ssh/authorized_keys"
-    [[ -z "$KEY_SOURCE" && "$INPUT_CLOUD_USER" != "root" && -f "/home/$INPUT_CLOUD_USER/.ssh/authorized_keys" ]] && KEY_SOURCE="/home/$INPUT_CLOUD_USER/.ssh/authorized_keys"
+    # Prefer the key the user explicitly pasted (most trustworthy).
+    # Fall back to the cloud user's key, then warn if falling back to root's.
+    KEY_CONTENT=""
 
-    if [[ -n "$KEY_SOURCE" ]]; then
-        cp "$KEY_SOURCE" "/home/$INPUT_USERNAME/.ssh/authorized_keys"
+    if [[ -n "${INPUT_PUBLIC_KEY:-}" ]]; then
+        KEY_CONTENT="$INPUT_PUBLIC_KEY"
+        log_info "Using the public key you pasted."
+    elif [[ "$INPUT_CLOUD_USER" != "root" ]] \
+         && [[ -f "/home/$INPUT_CLOUD_USER/.ssh/authorized_keys" ]] \
+         && [[ -s "/home/$INPUT_CLOUD_USER/.ssh/authorized_keys" ]]; then
+        KEY_CONTENT=$(cat "/home/$INPUT_CLOUD_USER/.ssh/authorized_keys")
+        log_info "Copying key from $INPUT_CLOUD_USER's authorized_keys."
+    elif [[ -f "/root/.ssh/authorized_keys" ]] \
+         && [[ -s "/root/.ssh/authorized_keys" ]]; then
+        KEY_CONTENT=$(cat "/root/.ssh/authorized_keys")
+        log_warn "Falling back to root's authorized_keys — verify these keys are yours."
+    fi
+
+    if [[ -n "$KEY_CONTENT" ]]; then
+        echo "$KEY_CONTENT" > "/home/$INPUT_USERNAME/.ssh/authorized_keys"
         chmod 600 "/home/$INPUT_USERNAME/.ssh/authorized_keys"
-        log_ok "SSH key copied to new account"
-    elif [[ -n "${INPUT_PUBLIC_KEY:-}" ]]; then
-        echo "$INPUT_PUBLIC_KEY" > "/home/$INPUT_USERNAME/.ssh/authorized_keys"
-        chmod 600 "/home/$INPUT_USERNAME/.ssh/authorized_keys"
-        log_ok "SSH key installed for new account"
+        log_ok "SSH key installed for $INPUT_USERNAME"
+    else
+        log_warn "No SSH key found — $INPUT_USERNAME will need a password to log in."
     fi
 else
-    log_info "Password mode — $INPUT_USERNAME will use password to login"
+    log_info "Password mode — $INPUT_USERNAME will use password to log in."
 fi
 
 chown -R "$INPUT_USERNAME:$INPUT_USERNAME" "/home/$INPUT_USERNAME/.ssh"
 
-# --- TEST ---
+# --- Test ---
 print_box "TEST YOUR NEW ADMIN ACCOUNT" "$YELLOW"
-
+echo -e "  Open a ${BOLD}NEW terminal${NC} and connect as your new user:"
+echo ""
 if [[ "$AUTH_TYPE" == "key" ]]; then
     echo -e "    ${CYAN}ssh -i /path/to/key -p $INPUT_SSH_PORT $INPUT_USERNAME@$PUBLIC_IP${NC}"
 else
     echo -e "    ${CYAN}ssh -p $INPUT_SSH_PORT $INPUT_USERNAME@$PUBLIC_IP${NC}"
     echo -e "    ${DIM}Use the password you just set for $INPUT_USERNAME${NC}"
 fi
-
 echo ""
 echo -e "  Then verify sudo works:"
 echo -e "    ${CYAN}sudo -l${NC}"
@@ -982,7 +1058,7 @@ read -rp "  Login and sudo both succeeded? (yes/no): " NEW_ACCT_TEST
 
 if [[ "$NEW_ACCT_TEST" != "yes" ]]; then
     echo ""
-    log_error "Test failed — SSH lockdown ${BOLD}NOT${NC} applied"
+    log_error "Test failed — SSH lockdown and port 22 closure NOT applied."
     log_error "Root access preserved. You are still connected."
     echo ""
     log_info "Diagnose:"
@@ -993,12 +1069,15 @@ if [[ "$NEW_ACCT_TEST" != "yes" ]]; then
     log_info "Once fixed, apply lockdown manually:"
     echo -e "    ${CYAN}sudo sed -i 's/PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config.d/99-hardened.conf${NC}"
     echo -e "    ${CYAN}echo 'AllowUsers $INPUT_USERNAME' | sudo tee -a /etc/ssh/sshd_config.d/99-hardened.conf${NC}"
+    echo -e "    ${CYAN}sudo ufw delete allow 22/tcp${NC}"
     echo -e "    ${CYAN}sudo sshd -t && sudo systemctl restart ssh${NC}"
     echo ""
-    log_warn "Continuing to Phase 11..."
+    log_warn "Continuing to Phase 11 without lockdown..."
 
 else
-    # Apply final lockdown
+    # -----------------------------------------------------------------------
+    # Apply final SSH lockdown
+    # -----------------------------------------------------------------------
     if [[ "$AUTH_TYPE" == "key" ]]; then
         cat > /etc/ssh/sshd_config.d/99-hardened.conf << EOF
 # Hardened SSH Configuration (FINAL)
@@ -1044,38 +1123,55 @@ EOF
 
     if sshd -t 2>/dev/null; then
         run_silent "Applying final SSH lockdown" systemctl restart ssh
-        log_ok "Root login ${BOLD}disabled${NC} — only ${BOLD}$INPUT_USERNAME${NC} can login"
+        log_ok "Root login ${BOLD}disabled${NC} — only ${BOLD}$INPUT_USERNAME${NC} can log in"
+
+        # Close port 22 NOW — after account is confirmed working
+        ufw delete allow 22/tcp > /dev/null 2>&1 || true
+        log_ok "Port 22 closed — only ${BOLD}$INPUT_SSH_PORT${NC} is accessible"
     else
-        log_error "Config error — keeping safe config"
+        log_error "SSH config syntax error — keeping safe config, NOT restarting"
     fi
 
-    # Demote cloud user
+    # -----------------------------------------------------------------------
+    # Demote the cloud default user
+    # -----------------------------------------------------------------------
     if [[ "$INPUT_CLOUD_USER" != "root" ]]; then
-        deluser "$INPUT_CLOUD_USER" sudo  2>/dev/null || true
-        deluser "$INPUT_CLOUD_USER" lxd   2>/dev/null || true
-        deluser "$INPUT_CLOUD_USER" cdrom 2>/dev/null || true
-        deluser "$INPUT_CLOUD_USER" dip   2>/dev/null || true
+        for GRP in sudo lxd cdrom dip; do
+            deluser "$INPUT_CLOUD_USER" "$GRP" 2>/dev/null || true
+        done
         passwd -l "$INPUT_CLOUD_USER" > /dev/null 2>&1 || true
-        log_ok "$INPUT_CLOUD_USER demoted and locked"
+        log_ok "$INPUT_CLOUD_USER demoted and account locked"
     fi
 
-    # Remove NOPASSWD
+    # -----------------------------------------------------------------------
+    # Remove NOPASSWD from the cloud user's sudoers file — use visudo -c
+    # to validate before overwriting, so a bad sed result can't lock out sudo.
+    # -----------------------------------------------------------------------
     SUDOERS_FILE=""
     for F in /etc/sudoers.d/*; do
-        if grep -q "$INPUT_CLOUD_USER" "$F" 2>/dev/null; then
-            SUDOERS_FILE="$F"
-            break
-        fi
+        grep -q "$INPUT_CLOUD_USER" "$F" 2>/dev/null && { SUDOERS_FILE="$F"; break; }
     done
+
     if [[ -n "$SUDOERS_FILE" ]]; then
-        cp "$SUDOERS_FILE" "${SUDOERS_FILE}.backup"
-        sed -i "s|$INPUT_CLOUD_USER ALL=(ALL) NOPASSWD:ALL|$INPUT_CLOUD_USER ALL=(ALL) ALL|g" "$SUDOERS_FILE"
-        sed -i "s|$INPUT_CLOUD_USER ALL=(ALL:ALL) NOPASSWD:ALL|$INPUT_CLOUD_USER ALL=(ALL:ALL) ALL|g" "$SUDOERS_FILE"
+        cp "$SUDOERS_FILE" "${SUDOERS_FILE}.tmp"
+        sed -i "s|$INPUT_CLOUD_USER ALL=(ALL) NOPASSWD:ALL|$INPUT_CLOUD_USER ALL=(ALL) ALL|g" \
+            "${SUDOERS_FILE}.tmp"
+        sed -i "s|$INPUT_CLOUD_USER ALL=(ALL:ALL) NOPASSWD:ALL|$INPUT_CLOUD_USER ALL=(ALL:ALL) ALL|g" \
+            "${SUDOERS_FILE}.tmp"
+
+        if visudo -c -f "${SUDOERS_FILE}.tmp" > /dev/null 2>&1; then
+            cp "$SUDOERS_FILE" "${SUDOERS_FILE}.backup"
+            mv "${SUDOERS_FILE}.tmp" "$SUDOERS_FILE"
+            log_ok "NOPASSWD removed from $INPUT_CLOUD_USER sudoers entry"
+        else
+            rm -f "${SUDOERS_FILE}.tmp"
+            log_warn "sudoers modification skipped — visudo validation failed (safe, no change made)"
+        fi
     fi
 fi
 
 # =============================================================================
-# PHASE 11 - MONITORING
+# PHASE 11 — SECURITY MONITORING
 # =============================================================================
 
 print_phase "11" "Security Monitoring" "Daily audits + on-demand health checks"
@@ -1092,167 +1188,238 @@ chmod 600 "$BASELINE_DIR/suid-baseline.txt"
 SUID_COUNT=$(wc -l < "$BASELINE_DIR/suid-baseline.txt")
 log_ok "SUID baseline: ${BOLD}$SUID_COUNT${NC} privileged binaries tracked"
 
-# --- Daily Audit ---
+# ---------------------------------------------------------------------------
+# daily-audit.sh — log-file oriented, plain text, runs from cron
+# ---------------------------------------------------------------------------
 cat > "$SCRIPTS_DIR/daily-audit.sh" << AUDIT_EOF
 #!/bin/bash
+# daily-audit.sh — plain-text log, designed for cron (no colour codes).
+# check-alerts.sh is the interactive companion with colours and summaries.
 LOGFILE="$AUDIT_LOG"
 DATE=\$(date '+%Y-%m-%d %H:%M:%S')
 
-echo "========================================" >> \$LOGFILE
-echo "Audit: \$DATE" >> \$LOGFILE
-echo "========================================" >> \$LOGFILE
+echo "========================================" >> "\$LOGFILE"
+echo "Audit: \$DATE"                            >> "\$LOGFILE"
+echo "========================================" >> "\$LOGFILE"
 
-echo "--- System Health ---" >> \$LOGFILE
-echo "Uptime: \$(uptime)" >> \$LOGFILE
-df -h / >> \$LOGFILE
-free -h >> \$LOGFILE
-echo "CPU Load: \$(cat /proc/loadavg)" >> \$LOGFILE
+echo "--- System Health ---"  >> "\$LOGFILE"
+echo "Uptime: \$(uptime)"     >> "\$LOGFILE"
+df -h /                        >> "\$LOGFILE"
+free -h                        >> "\$LOGFILE"
+echo "CPU Load: \$(cat /proc/loadavg)" >> "\$LOGFILE"
 
-echo "--- Failed SSH (24h) ---" >> \$LOGFILE
+echo "--- Failed SSH (24h) ---" >> "\$LOGFILE"
+FAILED=\$(journalctl -u ssh --since "24 hours ago" 2>/dev/null \
+    | grep -c "Invalid user\|Failed password" || echo 0)
+echo "Failed logins: \$FAILED" >> "\$LOGFILE"
 journalctl -u ssh --since "24 hours ago" 2>/dev/null \
-    | grep -c "Invalid user\|Failed password" \
-    | xargs echo "Failed:" >> \$LOGFILE
-journalctl -u ssh --since "24 hours ago" 2>/dev/null \
-    | grep -i "failed\|invalid" | tail -10 >> \$LOGFILE
+    | grep -i "failed\|invalid" | tail -10 >> "\$LOGFILE"
 
-echo "--- fail2ban (24h) ---" >> \$LOGFILE
-journalctl -u fail2ban --since "24 hours ago" 2>/dev/null | grep "Ban" >> \$LOGFILE
+echo "--- fail2ban (24h) ---" >> "\$LOGFILE"
+journalctl -u fail2ban --since "24 hours ago" 2>/dev/null \
+    | grep "Ban" >> "\$LOGFILE" || echo "No bans." >> "\$LOGFILE"
 
-echo "--- SUID Changes ---" >> \$LOGFILE
+echo "--- SUID Changes ---" >> "\$LOGFILE"
 find / -perm -4000 -type f 2>/dev/null | grep -v snap | sort > /tmp/current-suid.txt || true
-DIFF=\$(diff $BASELINE_DIR/suid-baseline.txt /tmp/current-suid.txt 2>/dev/null || true)
-if [ -z "\$DIFF" ]; then echo "No changes." >> \$LOGFILE; else echo "WARNING: SUID changed!" >> \$LOGFILE; echo "\$DIFF" >> \$LOGFILE; fi
+SDIFF=\$(diff $BASELINE_DIR/suid-baseline.txt /tmp/current-suid.txt 2>/dev/null || true)
+if [ -z "\$SDIFF" ]; then
+    echo "No SUID changes." >> "\$LOGFILE"
+else
+    echo "WARNING: SUID files changed!" >> "\$LOGFILE"
+    echo "\$SDIFF" >> "\$LOGFILE"
+fi
 rm -f /tmp/current-suid.txt
 
-echo "--- Ports ---" >> \$LOGFILE
-ss -tlnp >> \$LOGFILE
+echo "--- Open Ports ---" >> "\$LOGFILE"
+ss -tlnp >> "\$LOGFILE"
 
-echo "--- Users ---" >> \$LOGFILE
-who >> \$LOGFILE; last | head -5 >> \$LOGFILE
+echo "--- Logged-in Users ---" >> "\$LOGFILE"
+who        >> "\$LOGFILE"
+last | head -5 >> "\$LOGFILE"
 
-echo "--- Sudo (24h) ---" >> \$LOGFILE
-journalctl --since "24 hours ago" 2>/dev/null | grep "sudo" | grep -v "pam_unix" >> \$LOGFILE
-echo "" >> \$LOGFILE
+echo "--- Sudo Activity (24h) ---" >> "\$LOGFILE"
+journalctl --since "24 hours ago" 2>/dev/null \
+    | grep "sudo" | grep -v "pam_unix" >> "\$LOGFILE" || true
+
+echo "" >> "\$LOGFILE"
 AUDIT_EOF
 
-# --- Check Alerts ---
-cat > "$SCRIPTS_DIR/check-alerts.sh" << 'ALERT_HEADER'
+# ---------------------------------------------------------------------------
+# check-alerts.sh — interactive health dashboard with colours
+#
+# Heredoc delimiter is QUOTED ('ALERTS_SCRIPT') so that NO variables are
+# expanded during generation. Every dollar sign inside is a runtime variable.
+# The only values we need to bake in are $BASELINE_DIR and $AUDIT_LOG, which
+# we write via a separate echo after the heredoc closes.
+# ---------------------------------------------------------------------------
+cat > "$SCRIPTS_DIR/check-alerts.sh" << 'ALERTS_SCRIPT'
 #!/bin/bash
-RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
-CYAN='\033[0;36m'; MAGENTA='\033[0;35m'; WHITE='\033[1;37m'
-BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+# check-alerts.sh — interactive security health dashboard.
+# Run with: sudo check-alerts
+
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# BASELINE_DIR and AUDIT_LOG are injected below this heredoc.
+# shellcheck source=/dev/null
+source "$(dirname "$0")/.check-alerts-env" 2>/dev/null || true
 
 HOST=$(hostname)
 DATE=$(date '+%Y-%m-%d %H:%M:%S')
-UPTIME=$(uptime -p 2>/dev/null || echo "unknown")
+UPTIME_STR=$(uptime -p 2>/dev/null || echo "unknown")
 
 echo ""
 echo -e "${BOLD}${CYAN}  ╔══════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BOLD}${CYAN}  ║${NC}  ${BOLD}${WHITE}🛡️  Security Status — ${HOST}${NC}"
-echo -e "${BOLD}${CYAN}  ║${NC}  ${DIM}${DATE} • ${UPTIME}${NC}"
+echo -e "${BOLD}${CYAN}  ║${NC}  ${DIM}${DATE} • ${UPTIME_STR}${NC}"
 echo -e "${BOLD}${CYAN}  ╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-ALERTS=0; WARNINGS=0
+ALERTS=0
+WARNINGS=0
 
 check() {
-    local S="$1" M="$2"
-    case "$S" in
-        ok)   echo -e "  ${GREEN}✓${NC}  $M" ;;
-        warn) echo -e "  ${YELLOW}⚠${NC}  $M"; WARNINGS=$((WARNINGS+1)) ;;
-        crit) echo -e "  ${RED}✗${NC}  $M"; ALERTS=$((ALERTS+1)) ;;
-        info) echo -e "  ${CYAN}ℹ${NC}  $M" ;;
+    local STATUS="$1"
+    local MSG="$2"
+    case "$STATUS" in
+        ok)   echo -e "  ${GREEN}✓${NC}  $MSG" ;;
+        warn) echo -e "  ${YELLOW}⚠${NC}  $MSG"; WARNINGS=$((WARNINGS+1)) ;;
+        crit) echo -e "  ${RED}✗${NC}  $MSG";    ALERTS=$((ALERTS+1)) ;;
+        info) echo -e "  ${CYAN}ℹ${NC}  $MSG" ;;
     esac
 }
 
-ALERT_HEADER
-
-cat >> "$SCRIPTS_DIR/check-alerts.sh" << ALERT_BODY
-
 # Disk
-DISK=\$(df / | tail -1 | awk '{print \$5}' | tr -d '%')
-if [ "\$DISK" -gt 80 ]; then check "crit" "Disk: \${DISK}% — critically full"
-elif [ "\$DISK" -gt 60 ]; then check "warn" "Disk: \${DISK}% — getting full"
-else check "ok" "Disk: \${DISK}%"; fi
+DISK=$(df / | tail -1 | awk '{print $5}' | tr -d '%')
+if   [ "$DISK" -gt 80 ]; then check "crit" "Disk: ${DISK}% — critically full"
+elif [ "$DISK" -gt 60 ]; then check "warn" "Disk: ${DISK}% — getting full"
+else                           check "ok"   "Disk: ${DISK}%"
+fi
 
 # Memory
-MEM=\$(free | grep Mem | awk '{printf "%.0f", \$3/\$2*100}')
-if [ "\$MEM" -gt 90 ]; then check "crit" "Memory: \${MEM}%"
-elif [ "\$MEM" -gt 75 ]; then check "warn" "Memory: \${MEM}%"
-else check "ok" "Memory: \${MEM}%"; fi
+MEM=$(free | grep Mem | awk '{printf "%.0f", $3/$2*100}')
+if   [ "$MEM" -gt 90 ]; then check "crit" "Memory: ${MEM}%"
+elif [ "$MEM" -gt 75 ]; then check "warn" "Memory: ${MEM}%"
+else                          check "ok"   "Memory: ${MEM}%"
+fi
 
 # SSH failures
-FAILED=\$(journalctl -u ssh --since "24 hours ago" 2>/dev/null | grep -c "Invalid user\|Failed password" || echo 0)
-if [ "\$FAILED" -gt 200 ]; then check "crit" "Failed SSH (24h): \${FAILED} — unusual volume"
-elif [ "\$FAILED" -gt 50 ]; then check "warn" "Failed SSH (24h): \${FAILED}"
-else check "ok" "Failed SSH (24h): \${FAILED}"; fi
+FAILED=$(journalctl -u ssh --since "24 hours ago" 2>/dev/null \
+    | grep -c "Invalid user\|Failed password" || echo 0)
+if   [ "$FAILED" -gt 200 ]; then check "crit" "Failed SSH (24h): ${FAILED} — unusual volume"
+elif [ "$FAILED" -gt 50  ]; then check "warn" "Failed SSH (24h): ${FAILED}"
+else                              check "ok"   "Failed SSH (24h): ${FAILED}"
+fi
 
 # fail2ban
-BANS=\$(fail2ban-client status sshd 2>/dev/null | grep "Currently banned" | awk '{print \$NF}')
-BANS=\${BANS:-0}
-TOTAL=\$(fail2ban-client status sshd 2>/dev/null | grep "Total banned" | awk '{print \$NF}')
-TOTAL=\${TOTAL:-0}
-if [ "\$BANS" -gt 0 ]; then
-    check "info" "fail2ban: \${BANS} currently banned (\${TOTAL} total)"
-    BANNED_IPS=\$(fail2ban-client status sshd 2>/dev/null | grep "Banned IP" | cut -d: -f2)
-    echo -e "  \${DIM}  \$BANNED_IPS\${NC}"
-else check "ok" "fail2ban: No IPs banned (\${TOTAL} total)"; fi
+BANS=$(fail2ban-client status sshd 2>/dev/null \
+    | grep "Currently banned" | awk '{print $NF}')
+BANS=${BANS:-0}
+TOTAL=$(fail2ban-client status sshd 2>/dev/null \
+    | grep "Total banned" | awk '{print $NF}')
+TOTAL=${TOTAL:-0}
+if [ "$BANS" -gt 0 ]; then
+    check "info" "fail2ban: ${BANS} currently banned (${TOTAL} total)"
+    BANNED_IPS=$(fail2ban-client status sshd 2>/dev/null \
+        | grep "Banned IP" | cut -d: -f2)
+    echo -e "  ${DIM}  ${BANNED_IPS}${NC}"
+else
+    check "ok" "fail2ban: No IPs currently banned (${TOTAL} total)"
+fi
 
-# SUID
-find / -perm -4000 -type f 2>/dev/null | grep -v snap | sort > /tmp/suid-chk.txt || true
-SDIFF=\$(diff $BASELINE_DIR/suid-baseline.txt /tmp/suid-chk.txt 2>/dev/null || true)
-rm -f /tmp/suid-chk.txt
-if [ -n "\$SDIFF" ]; then check "crit" "SUID files changed — investigate!"; echo "\$SDIFF"
-else check "ok" "SUID files unchanged (\$(wc -l < $BASELINE_DIR/suid-baseline.txt) tracked)"; fi
+# SUID drift — BASELINE_DIR sourced from .check-alerts-env
+if [ -f "${BASELINE_DIR}/suid-baseline.txt" ]; then
+    find / -perm -4000 -type f 2>/dev/null | grep -v snap | sort > /tmp/suid-chk.txt || true
+    SDIFF=$(diff "${BASELINE_DIR}/suid-baseline.txt" /tmp/suid-chk.txt 2>/dev/null || true)
+    rm -f /tmp/suid-chk.txt
+    if [ -n "$SDIFF" ]; then
+        check "crit" "SUID files changed — investigate!"
+        echo "$SDIFF"
+    else
+        SUID_COUNT=$(wc -l < "${BASELINE_DIR}/suid-baseline.txt")
+        check "ok" "SUID files unchanged (${SUID_COUNT} tracked)"
+    fi
+else
+    check "warn" "SUID baseline not found — run harden.sh to generate it"
+fi
 
-# Services
+# Critical services
 for SVC in ssh fail2ban; do
-    if systemctl is-active --quiet "\$SVC"; then check "ok" "\$SVC running"
-    else check "crit" "\$SVC NOT running — investigate"; fi
+    if systemctl is-active --quiet "$SVC"; then
+        check "ok" "$SVC running"
+    else
+        check "crit" "$SVC NOT running — investigate immediately"
+    fi
 done
 
 # UFW
-if ufw status | grep -q "Status: active"; then check "ok" "UFW firewall active"
-else check "crit" "UFW firewall NOT active"; fi
-
-# AppArmor
-if command -v aa-status &>/dev/null; then
-    ENF=\$(aa-status 2>/dev/null | grep "in enforce mode" | head -1 | awk '{print \$1}' || echo "0")
-    check "ok" "AppArmor: \${ENF} profiles enforcing"
+if ufw status 2>/dev/null | grep -q "Status: active"; then
+    check "ok" "UFW firewall active"
+else
+    check "crit" "UFW firewall NOT active"
 fi
 
-# Ports
+# AppArmor
+if command -v aa-status > /dev/null 2>&1; then
+    ENF=$(aa-status 2>/dev/null | grep "in enforce mode" | head -1 | awk '{print $1}' || echo "0")
+    check "ok" "AppArmor: ${ENF} profiles enforcing"
+fi
+
+# Open ports
 echo ""
-echo -e "  \${BOLD}Listening Ports:\${NC}"
+echo -e "  ${BOLD}Listening Ports:${NC}"
 ss -tlnp | grep LISTEN | while read -r line; do
-    PORT=\$(echo "\$line" | awk '{print \$4}' | rev | cut -d: -f1 | rev)
-    PROC=\$(echo "\$line" | grep -oP 'users:\(\("\K[^"]+' || echo "?")
-    echo -e "    \${DIM}:\$PORT\${NC} — \$PROC"
+    PORT=$(echo "$line" | awk '{print $4}' | rev | cut -d: -f1 | rev)
+    PROC=$(echo "$line" | grep -oP 'users:\(\("\K[^"]+' || echo "?")
+    echo -e "    ${DIM}:${PORT}${NC} — ${PROC}"
 done
 
 # Summary
 echo ""
-echo -e "  \${DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\${NC}"
-if [ "\$ALERTS" -gt 0 ]; then
-    echo -e "  \${RED}✗  \${ALERTS} critical alert(s) — action required\${NC}"
-elif [ "\$WARNINGS" -gt 0 ]; then
-    echo -e "  \${YELLOW}⚠  \${WARNINGS} warning(s) — review when possible\${NC}"
+echo -e "  ${DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+if   [ "$ALERTS"   -gt 0 ]; then
+    echo -e "  ${RED}✗  ${ALERTS} critical alert(s) — action required${NC}"
+elif [ "$WARNINGS" -gt 0 ]; then
+    echo -e "  ${YELLOW}⚠  ${WARNINGS} warning(s) — review when possible${NC}"
 else
-    echo -e "  \${GREEN}✓  All systems healthy — no issues found\${NC}"
+    echo -e "  ${GREEN}✓  All systems healthy — no issues found${NC}"
 fi
 echo ""
-ALERT_BODY
+ALERTS_SCRIPT
+
+# Write the two baked-in values into a tiny env file sourced at runtime.
+# This keeps the heredoc above fully quoted (no accidental expansions)
+# while still letting check-alerts.sh know where the baseline lives.
+cat > "$SCRIPTS_DIR/.check-alerts-env" << ENV_EOF
+# Auto-generated by harden.sh — do not edit manually.
+BASELINE_DIR="$BASELINE_DIR"
+AUDIT_LOG="$AUDIT_LOG"
+ENV_EOF
+chmod 640 "$SCRIPTS_DIR/.check-alerts-env"
 
 # Permissions
 chmod 750 "$SCRIPTS_DIR/daily-audit.sh" "$SCRIPTS_DIR/check-alerts.sh"
-if id "$INPUT_USERNAME" &>/dev/null; then
-    chown root:"$INPUT_USERNAME" "$SCRIPTS_DIR/daily-audit.sh" "$SCRIPTS_DIR/check-alerts.sh"
+if id "$INPUT_USERNAME" > /dev/null 2>&1; then
+    chown root:"$INPUT_USERNAME" \
+        "$SCRIPTS_DIR/daily-audit.sh" \
+        "$SCRIPTS_DIR/check-alerts.sh" \
+        "$SCRIPTS_DIR/.check-alerts-env"
 fi
+
 ln -sf "$SCRIPTS_DIR/check-alerts.sh" /usr/local/bin/check-alerts
 
-# Cron — FIXED: || true prevents exit when no crontab exists
-(crontab -l 2>/dev/null || true; echo "0 4 * * * $SCRIPTS_DIR/daily-audit.sh") | crontab -
-log_ok "Daily audit scheduled at ${BOLD}4:00 AM${NC}"
+# Idempotent cron installation — prevents duplicate entries on re-runs
+CRON_CMD="0 4 * * * $SCRIPTS_DIR/daily-audit.sh"
+( crontab -l 2>/dev/null || true ) \
+    | grep -qF "$SCRIPTS_DIR/daily-audit.sh" \
+    || { ( crontab -l 2>/dev/null || true; echo "$CRON_CMD" ) | crontab -; }
+log_ok "Daily audit scheduled at ${BOLD}4:00 AM${NC} (idempotent — no duplicates on re-run)"
 
 run_silent "Running initial audit" bash "$SCRIPTS_DIR/daily-audit.sh"
 log_ok "Monitoring installed — run ${BOLD}${CYAN}sudo check-alerts${NC} anytime"
@@ -1264,7 +1431,7 @@ log_ok "Monitoring installed — run ${BOLD}${CYAN}sudo check-alerts${NC} anytim
 SCRIPT_END=$(date +%s)
 ELAPSED=$(( SCRIPT_END - SCRIPT_START ))
 MINUTES=$(( ELAPSED / 60 ))
-SECONDS_REMAINING=$(( ELAPSED % 60 ))
+SECS=$(( ELAPSED % 60 ))
 
 echo ""
 echo ""
@@ -1272,16 +1439,13 @@ echo -e "${BOLD}${GREEN}"
 echo "  ╔══════════════════════════════════════════════════════════╗"
 echo "  ║                                                          ║"
 echo "  ║    🛡️   VPS HARDENING COMPLETE                          ║"
-echo "  ║                                                          ║"
 echo "  ║    Your server is now secured and monitored.             ║"
 echo "  ║                                                          ║"
 echo "  ╚══════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
-
-echo -e "  ${DIM}Completed in ${MINUTES}m ${SECONDS_REMAINING}s${NC}"
+echo -e "  ${DIM}Completed in ${MINUTES}m ${SECS}s${NC}"
 echo ""
 
-# Security Summary
 echo -e "  ${BOLD}${WHITE}What was secured:${NC}"
 echo ""
 echo -e "  ${GREEN}✓${NC}  ${BOLD}Firewall${NC}         Only port $INPUT_SSH_PORT is open"
@@ -1289,18 +1453,17 @@ echo -e "  ${GREEN}✓${NC}  ${BOLD}SSH${NC}              Moved from 22 → $INP
 echo -e "  ${GREEN}✓${NC}  ${BOLD}Admin Account${NC}    ${BOLD}$INPUT_USERNAME${NC} created with sudo access"
 
 if [[ "$AUTH_TYPE" == "key" ]]; then
-    echo -e "  ${GREEN}✓${NC}  ${BOLD}Auth Method${NC}      SSH key only — passwords disabled"
+    echo -e "  ${GREEN}✓${NC}  ${BOLD}Auth Method${NC}      SSH key only — passwords rejected"
 else
     echo -e "  ${YELLOW}⚠${NC}  ${BOLD}Auth Method${NC}      Password ${DIM}(upgrade to SSH keys recommended)${NC}"
 fi
 
-echo -e "  ${GREEN}✓${NC}  ${BOLD}fail2ban${NC}         3 failed logins = 24 hour IP ban"
+echo -e "  ${GREEN}✓${NC}  ${BOLD}fail2ban${NC}         3 failed logins = 24 h IP ban"
 echo -e "  ${GREEN}✓${NC}  ${BOLD}AppArmor${NC}         Mandatory access control enforcing"
-echo -e "  ${GREEN}✓${NC}  ${BOLD}Logging${NC}          Persistent, reboot-safe, 500MB limit"
+echo -e "  ${GREEN}✓${NC}  ${BOLD}Logging${NC}          Persistent, reboot-safe, 500 MB cap"
 echo -e "  ${GREEN}✓${NC}  ${BOLD}Monitoring${NC}       Daily audit at 4 AM + on-demand health check"
 echo -e "  ${GREEN}✓${NC}  ${BOLD}Cleanup${NC}          Unnecessary services and packages removed"
 
-# Server Details
 echo ""
 echo -e "  ${DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
@@ -1314,13 +1477,11 @@ echo -e "    ${DIM}Auth${NC}           ${BOLD}$AUTH_TYPE${NC}"
 echo -e "    ${DIM}Provider${NC}       $CLOUD_PROVIDER"
 echo -e "    ${DIM}OS${NC}             $OS_ID $OS_VERSION"
 
-# Connection Command
 echo ""
 echo -e "  ${DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo -e "  ${BOLD}${WHITE}🔑 How to connect from now on:${NC}"
 echo ""
-
 if [[ "$AUTH_TYPE" == "key" ]]; then
     echo -e "    ${DIM}Mac / Linux:${NC}"
     echo -e "    ${CYAN}ssh -i ~/.ssh/id_ed25519 -p $INPUT_SSH_PORT $INPUT_USERNAME@$PUBLIC_IP${NC}"
@@ -1331,7 +1492,6 @@ else
     echo -e "    ${CYAN}ssh -p $INPUT_SSH_PORT $INPUT_USERNAME@$PUBLIC_IP${NC}"
 fi
 
-# Daily Commands
 echo ""
 echo -e "  ${DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
@@ -1339,12 +1499,11 @@ echo -e "  ${BOLD}${WHITE}📋 Useful Commands:${NC}"
 echo ""
 echo -e "    ${CYAN}sudo check-alerts${NC}                  ${DIM}Full security health check${NC}"
 echo -e "    ${CYAN}sudo fail2ban-client status sshd${NC}   ${DIM}View banned attackers${NC}"
-echo -e "    ${CYAN}sudo ufw status verbose${NC}             ${DIM}View firewall rules${NC}"
-echo -e "    ${CYAN}sudo journalctl -u ssh -n 50${NC}        ${DIM}Recent SSH activity${NC}"
+echo -e "    ${CYAN}sudo ufw status verbose${NC}            ${DIM}View firewall rules${NC}"
+echo -e "    ${CYAN}sudo journalctl -u ssh -n 50${NC}       ${DIM}Recent SSH activity${NC}"
 echo -e "    ${CYAN}sudo tail -f $AUDIT_LOG${NC}"
 echo -e "                                          ${DIM}Live audit log${NC}"
 
-# Next Steps
 echo ""
 echo -e "  ${DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
@@ -1353,7 +1512,6 @@ echo ""
 
 STEP=1
 
-# Reboot if needed
 if [[ -f /var/run/reboot-required ]]; then
     echo -e "  ${YELLOW}  $STEP.${NC}  ${BOLD}Reboot your server${NC} to load the new kernel"
     echo -e "       ${CYAN}sudo reboot${NC}"
@@ -1362,7 +1520,6 @@ if [[ -f /var/run/reboot-required ]]; then
     echo ""
 fi
 
-# SSH keys upgrade
 if [[ "$AUTH_TYPE" == "password" ]]; then
     echo -e "  ${YELLOW}  $STEP.${NC}  ${BOLD}Upgrade to SSH keys${NC} for maximum security"
     echo -e "       ${DIM}On your local machine:${NC}"
@@ -1379,7 +1536,6 @@ if [[ "$AUTH_TYPE" == "password" ]]; then
     echo ""
 fi
 
-# Cloud console
 if [[ "$CLOUD_PROVIDER" =~ ^(oracle|aws|azure|gcp)$ ]]; then
     echo -e "  ${YELLOW}  $STEP.${NC}  ${BOLD}Cloud firewall${NC} — verify port $INPUT_SSH_PORT is open"
     echo -e "       ${DIM}in your ${CLOUD_PROVIDER} network security console${NC}"
@@ -1387,11 +1543,10 @@ if [[ "$CLOUD_PROVIDER" =~ ^(oracle|aws|azure|gcp)$ ]]; then
     echo ""
 fi
 
-echo -e "  ${YELLOW}  $STEP.${NC}  ${BOLD}Run a health check${NC} after rebooting"
+echo -e "  ${YELLOW}  $STEP.${NC}  ${BOLD}Run a health check${NC} after reconnecting"
 echo -e "       ${CYAN}sudo check-alerts${NC}"
 echo ""
 
-# Key Files
 echo -e "  ${DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo -e "  ${BOLD}${WHITE}📁 Key Files:${NC}"
