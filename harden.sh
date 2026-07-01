@@ -52,15 +52,57 @@ get_public_ip() {
 }
 
 # =============================================================================
-# SAFE FIND WRAPPER
-# find exits non-zero when it hits permission-denied directories like /proc
-# This wrapper prevents set -e from killing the script
+# SAFE FIND SUID
+# find returns non-zero when hitting /proc /sys permission errors
+# The || true prevents set -euo pipefail from killing the script
 # =============================================================================
 
 safe_find_suid() {
-    local OUTPUT
-    OUTPUT=$(find / -perm -4000 -type f 2>/dev/null | grep -v snap | sort) || true
-    echo "$OUTPUT"
+    find / -perm -4000 -type f 2>/dev/null | grep -v snap | sort || true
+}
+
+# =============================================================================
+# SSH SOCKET FIX
+# Ubuntu 24.04 uses socket activation which holds port 22 in systemd
+# regardless of what Port is set in sshd_config
+# We always attempt this fix on Ubuntu 24.04
+# =============================================================================
+
+apply_ssh_socket_fix() {
+    log_info "Checking for SSH socket activation..."
+
+    local SOCKET_EXISTS=false
+
+    if systemctl list-units --all 2>/dev/null | grep -q "ssh.socket"; then
+        SOCKET_EXISTS=true
+    fi
+    if systemctl list-unit-files 2>/dev/null | grep -q "ssh.socket"; then
+        SOCKET_EXISTS=true
+    fi
+    if [[ -f /lib/systemd/system/ssh.socket ]] || \
+       [[ -f /usr/lib/systemd/system/ssh.socket ]]; then
+        SOCKET_EXISTS=true
+    fi
+
+    if [[ "$SOCKET_EXISTS" == "true" ]]; then
+        log_info "SSH socket found. Disabling socket activation..."
+        systemctl stop ssh.socket    2>/dev/null || true
+        systemctl disable ssh.socket 2>/dev/null || true
+        systemctl mask ssh.socket    2>/dev/null || true
+        systemctl enable ssh.service 2>/dev/null || true
+        log_ok "SSH socket activation disabled. sshd now manages its own port."
+    else
+        log_info "No SSH socket activation found. Skipping."
+    fi
+
+    # Always ensure /run/sshd exists
+    # This directory is required for privilege separation
+    # It lives in tmpfs and disappears when the socket is stopped
+    if [[ ! -d /run/sshd ]]; then
+        mkdir -p /run/sshd
+        chmod 755 /run/sshd
+        log_ok "/run/sshd created."
+    fi
 }
 
 # =============================================================================
@@ -83,8 +125,10 @@ detect_environment() {
         [[ "$CONTINUE_ANYWAY" != "yes" ]] && exit 1
     fi
 
-    # Detect who is currently logged in
+    # Detect current user
     CURRENT_USER="${SUDO_USER:-root}"
+
+    # Detect cloud provider
     CLOUD_PROVIDER="generic"
     DEFAULT_CLOUD_USER="$CURRENT_USER"
 
@@ -130,8 +174,7 @@ detect_environment() {
         DEFAULT_CLOUD_USER="azureuser"
     fi
 
-    # Verify detected cloud user actually exists on this system
-    # If not, fall back to the current logged-in user
+    # Verify detected cloud user exists — fall back to current user if not
     if ! id "$DEFAULT_CLOUD_USER" &>/dev/null; then
         log_warn "Detected cloud user '$DEFAULT_CLOUD_USER' does not exist."
         DEFAULT_CLOUD_USER="$CURRENT_USER"
@@ -142,18 +185,7 @@ detect_environment() {
     log_info "Default cloud user: $DEFAULT_CLOUD_USER"
     log_info "Current login user: $CURRENT_USER"
 
-    # Ubuntu 24.04 uses SSH socket activation which hardcodes port 22
-    # We need to disable the socket and let sshd manage its own port
-    USE_SSH_SOCKET_FIX=false
-    if [[ "$OS_VERSION" == "24.04" ]]; then
-        if systemctl list-units --all 2>/dev/null | grep -q "ssh.socket"; then
-            USE_SSH_SOCKET_FIX=true
-            log_info "Ubuntu 24.04 SSH socket activation detected."
-        fi
-    fi
-
-    # Some providers (Oracle) pre-install iptables REJECT rules that sit
-    # above UFW and silently block traffic UFW would allow
+    # Detect conflicting iptables rules
     CONFLICTING_IPTABLES=false
     CONFLICTING_LINES=()
 
@@ -170,11 +202,11 @@ detect_environment() {
 
     if [[ "$CONFLICTING_IPTABLES" == "true" ]]; then
         log_warn "Conflicting iptables rules at lines: ${CONFLICTING_LINES[*]}"
-        log_warn "These will be removed automatically during Phase 4."
     else
         log_ok "No conflicting iptables rules."
     fi
 
+    # Detect cloud-init
     HAS_CLOUD_INIT=false
     if command -v cloud-init &>/dev/null; then
         HAS_CLOUD_INIT=true
@@ -183,6 +215,7 @@ detect_environment() {
         log_info "cloud-init not detected."
     fi
 
+    # Detect unnecessary services
     HAS_RPCBIND=false
     HAS_MODEMMANAGER=false
     HAS_ISCSID=false
@@ -235,7 +268,6 @@ if [[ "$AUTH_METHOD" == "1" ]]; then
     AUTH_TYPE="key"
     log_ok "SSH key authentication selected."
 
-    # Verify a key actually exists on this server
     CURRENT_USER_HOME=$(eval echo "~${SUDO_USER:-$USER}")
     if [[ -f "$CURRENT_USER_HOME/.ssh/authorized_keys" ]] && \
        [[ -s "$CURRENT_USER_HOME/.ssh/authorized_keys" ]]; then
@@ -245,13 +277,11 @@ if [[ "$AUTH_METHOD" == "1" ]]; then
         log_ok "Found authorized_keys at /root/.ssh/authorized_keys"
     else
         log_warn "No authorized_keys file found on this server."
-        log_warn "Are you sure you logged in with a key?"
         read -rp "Continue anyway? (yes/no): " KEY_CONFIRM
         [[ "$KEY_CONFIRM" != "yes" ]] && exit 1
     fi
 
 else
-    # Password user — recommend key but do not force it
     echo ""
     echo -e "${BOLD}${YELLOW}═══════════════════════════════════════════════════${NC}"
     echo -e "${BOLD}${YELLOW}  SSH KEY RECOMMENDATION${NC}"
@@ -291,27 +321,24 @@ else
         echo ""
 
         read -rp "Have you generated the key on your local machine? (yes/no): " KEY_GENERATED
-
         if [[ "$KEY_GENERATED" != "yes" ]]; then
-            log_warn "Please generate a key first, then re-run this script."
-            log_warn "Or choose option b to continue with password only."
+            log_warn "Generate a key first, then re-run this script."
             exit 1
         fi
 
         echo ""
         echo -e "${BOLD}Paste your PUBLIC key below (.pub file content):${NC}"
-        echo -e "${YELLOW}Must start with ssh-ed25519, ssh-rsa, or ssh-ecdsa${NC}"
+        echo -e "${YELLOW}Must start with: ssh-ed25519, ssh-rsa, or ssh-ecdsa${NC}"
         echo ""
         read -rp "> " INPUT_PUBLIC_KEY
 
         while [[ ! "$INPUT_PUBLIC_KEY" =~ ^ssh-(ed25519|rsa|ecdsa) ]]; do
-            log_warn "Invalid key format. Should start with ssh-ed25519, ssh-rsa, or ssh-ecdsa."
-            log_warn "Make sure you copied the .pub file, not the private key."
+            log_warn "Invalid key. Should start with ssh-ed25519, ssh-rsa, or ssh-ecdsa."
+            log_warn "Make sure you copied the .pub file not the private key."
             echo ""
             read -rp "Paste your public key: " INPUT_PUBLIC_KEY
         done
 
-        # Install the key for the current user
         if [[ "$CURRENT_USER" == "root" ]]; then
             KEY_DIR="/root/.ssh"
         else
@@ -327,14 +354,11 @@ else
         fi
         log_ok "Public key installed to $KEY_DIR/authorized_keys"
 
-        # Test key login before continuing
         PUBLIC_IP_EARLY=$(get_public_ip)
         echo ""
         echo -e "${BOLD}${YELLOW}═══════════════════════════════════════════════════${NC}"
-        echo -e "${BOLD}  TEST YOUR KEY LOGIN NOW${NC}"
+        echo -e "${BOLD}  TEST YOUR KEY LOGIN NOW (port 22 — before port change)${NC}"
         echo -e "${BOLD}${YELLOW}═══════════════════════════════════════════════════${NC}"
-        echo ""
-        echo -e "Open a ${BOLD}NEW terminal${NC} on your local machine and run:"
         echo ""
         echo -e "  ${CYAN}Mac/Linux:${NC}"
         echo -e "    ssh -i ~/.ssh/id_ed25519 $CURRENT_USER@$PUBLIC_IP_EARLY"
@@ -342,15 +366,16 @@ else
         echo -e "  ${CYAN}Windows:${NC}"
         echo -e "    ssh -i \$env:USERPROFILE\\.ssh\\id_ed25519 $CURRENT_USER@$PUBLIC_IP_EARLY"
         echo ""
-        echo -e "If it connects ${GREEN}without a password prompt${NC}, the key is working."
-        echo -e "${RED}Keep THIS session open!${NC}"
+        echo -e "  If it connects ${GREEN}without a password prompt${NC} the key is working."
+        echo -e "  ${RED}Keep THIS session open!${NC}"
         echo ""
         read -rp "Did the SSH key login succeed? (yes/no): " KEY_TEST
 
         if [[ "$KEY_TEST" != "yes" ]]; then
             echo ""
             log_warn "Key login did not work."
-            echo -e "  ${CYAN}1)${NC} Check you copied the .pub file (public key)"
+            echo -e "  Fixes to try:"
+            echo -e "  ${CYAN}1)${NC} Make sure you copied the .pub file (public key)"
             echo -e "  ${CYAN}2)${NC} Check: cat $KEY_DIR/authorized_keys"
             echo -e "  ${CYAN}3)${NC} Debug: ssh -vvv -i ~/.ssh/id_ed25519 $CURRENT_USER@$PUBLIC_IP_EARLY"
             echo ""
@@ -400,7 +425,7 @@ while [[ -z "$INPUT_USERNAME" || \
     read -rp "Enter new admin username: " INPUT_USERNAME
 done
 
-# Cloud user to demote — only ask if not root
+# Cloud user — only ask if not root
 INPUT_CLOUD_USER="$CURRENT_USER"
 if [[ "$CURRENT_USER" != "root" ]]; then
     read -rp "Cloud username to demote [$CURRENT_USER]: " INPUT_CLOUD_USER
@@ -410,19 +435,18 @@ fi
 echo ""
 echo -e "${BOLD}═══════════════════════════════════════════════════${NC}"
 echo -e "${BOLD}Configuration Summary:${NC}"
-echo -e "  Hostname:             ${GREEN}$INPUT_HOSTNAME${NC}"
-echo -e "  SSH Port:             ${GREEN}$INPUT_SSH_PORT${NC}"
-echo -e "  New Admin User:       ${GREEN}$INPUT_USERNAME${NC}"
-echo -e "  Current User:         ${GREEN}$INPUT_CLOUD_USER${NC}"
-echo -e "  Auth Method:          ${GREEN}$AUTH_TYPE${NC}"
-echo -e "  Provider:             ${GREEN}$CLOUD_PROVIDER${NC}"
-echo -e "  Ubuntu 24.04 SSH fix: ${GREEN}$USE_SSH_SOCKET_FIX${NC}"
-echo -e "  Fix iptables:         ${GREEN}$CONFLICTING_IPTABLES${NC}"
+echo -e "  Hostname:         ${GREEN}$INPUT_HOSTNAME${NC}"
+echo -e "  SSH Port:         ${GREEN}$INPUT_SSH_PORT${NC}"
+echo -e "  New Admin User:   ${GREEN}$INPUT_USERNAME${NC}"
+echo -e "  Current User:     ${GREEN}$INPUT_CLOUD_USER${NC}"
+echo -e "  Auth Method:      ${GREEN}$AUTH_TYPE${NC}"
+echo -e "  Provider:         ${GREEN}$CLOUD_PROVIDER${NC}"
+echo -e "  Fix iptables:     ${GREEN}$CONFLICTING_IPTABLES${NC}"
 
 if [[ "$AUTH_TYPE" == "password" ]]; then
     echo ""
     echo -e "  ${YELLOW}⚠  Password auth will remain enabled.${NC}"
-    echo -e "  ${YELLOW}   Other hardening still applies (port, rate limits, etc.)${NC}"
+    echo -e "  ${YELLOW}   All other hardening still applies.${NC}"
 fi
 echo -e "${BOLD}═══════════════════════════════════════════════════${NC}"
 echo ""
@@ -431,7 +455,6 @@ read -rp "Proceed with these settings? (yes/no): " CONFIRM
 
 # =============================================================================
 # LOGGING SETUP
-# All output from here on is saved to the log file
 # =============================================================================
 
 LOGFILE="/var/log/harden-script.log"
@@ -443,7 +466,6 @@ echo "════════════════════════�
 
 # =============================================================================
 # PHASE 1 - INITIAL ASSESSMENT
-# Informational only — no changes made
 # =============================================================================
 
 log_section "Phase 1 - Initial Assessment"
@@ -473,13 +495,6 @@ if [[ -d /etc/ssh/sshd_config.d ]]; then
     cat /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true
 fi
 
-log_info "Sudoers:"
-grep -v "^#" /etc/sudoers | grep -v "^$" || true
-if [[ -d /etc/sudoers.d ]]; then
-    ls /etc/sudoers.d/ 2>/dev/null || true
-    cat /etc/sudoers.d/* 2>/dev/null || true
-fi
-
 log_info "iptables INPUT chain:"
 iptables -L INPUT -n --line-numbers 2>/dev/null || log_warn "iptables unavailable"
 
@@ -490,7 +505,7 @@ log_info "Public IP:"
 PUBLIC_IP=$(get_public_ip)
 echo "$PUBLIC_IP"
 
-log_ok "Assessment complete. Review output above."
+log_ok "Assessment complete."
 pause
 
 # =============================================================================
@@ -507,7 +522,7 @@ log_info "Setting hostname to: $INPUT_HOSTNAME"
 hostnamectl set-hostname "$INPUT_HOSTNAME"
 
 if [[ "$HAS_CLOUD_INIT" == "true" ]]; then
-    log_info "Preventing cloud-init from resetting hostname on reboot..."
+    log_info "Preventing cloud-init from resetting hostname..."
     echo "preserve_hostname: true" \
         | tee /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg
     log_ok "cloud-init hostname preservation configured."
@@ -538,7 +553,7 @@ disable_and_mask() {
         if systemctl stop "$SERVICE" 2>/dev/null; then
             log_ok "Stopped $SERVICE"
         else
-            log_warn "Could not stop $SERVICE (may not be running)"
+            log_warn "Could not stop $SERVICE"
         fi
         if systemctl disable "$SERVICE" 2>/dev/null; then
             log_ok "Disabled $SERVICE"
@@ -551,7 +566,7 @@ disable_and_mask() {
             log_warn "Could not mask $SERVICE"
         fi
     else
-        log_info "Not found on this system, skipping: $SERVICE"
+        log_info "Not found, skipping: $SERVICE"
     fi
 }
 
@@ -559,11 +574,9 @@ if [[ "$HAS_RPCBIND" == "true" ]]; then
     disable_and_mask "rpcbind.socket"
     disable_and_mask "rpcbind.service"
 fi
-
 if [[ "$HAS_MODEMMANAGER" == "true" ]]; then
     disable_and_mask "ModemManager"
 fi
-
 if [[ "$HAS_ISCSID" == "true" ]]; then
     disable_and_mask "iscsid.socket"
     disable_and_mask "iscsid.service"
@@ -595,26 +608,16 @@ log_info "Enabling UFW..."
 echo "y" | ufw enable
 log_ok "UFW enabled."
 
-# Remove conflicting iptables rules auto-detected earlier
 if [[ "$CONFLICTING_IPTABLES" == "true" ]]; then
     log_info "Removing conflicting iptables rules: ${CONFLICTING_LINES[*]}"
-
-    # Sort descending — delete higher line numbers first
-    # because deleting shifts subsequent numbers down
     mapfile -t SORTED_LINES < <(printf '%s\n' "${CONFLICTING_LINES[@]}" | sort -rn)
-
     for LINE_NUM in "${SORTED_LINES[@]}"; do
-        log_info "Deleting INPUT rule #$LINE_NUM"
         if iptables -D INPUT "$LINE_NUM" 2>/dev/null; then
-            log_ok "Deleted rule $LINE_NUM"
+            log_ok "Deleted iptables rule $LINE_NUM"
         else
-            log_warn "Could not delete rule $LINE_NUM (may have shifted)"
+            log_warn "Could not delete rule $LINE_NUM"
         fi
     done
-
-    log_info "iptables after cleanup:"
-    iptables -L INPUT -n --line-numbers || true
-
     mkdir -p /etc/iptables
     sh -c 'iptables-save > /etc/iptables/rules.v4'
     log_ok "Saved clean iptables rules."
@@ -622,40 +625,31 @@ else
     log_ok "No conflicting iptables rules to remove."
 fi
 
-# Remind cloud provider users to open the port in their web console too
 case "$CLOUD_PROVIDER" in
     oracle)
         echo ""
-        log_warn "ORACLE CLOUD: You must also open port $INPUT_SSH_PORT"
-        log_warn "in the Oracle Security List (web console)."
+        log_warn "ORACLE: Also open port $INPUT_SSH_PORT in Security Lists."
         log_warn "VCN → Subnet → Security List → Add Ingress Rule"
         echo ""
-        pause
-        ;;
+        pause ;;
     aws)
         echo ""
-        log_warn "AWS: You must also open port $INPUT_SSH_PORT"
-        log_warn "in your EC2 Security Group (AWS Console)."
+        log_warn "AWS: Also open port $INPUT_SSH_PORT in EC2 Security Group."
         log_warn "EC2 → Security Groups → Inbound Rules → Add Rule"
         echo ""
-        pause
-        ;;
+        pause ;;
     azure)
         echo ""
-        log_warn "AZURE: You must also open port $INPUT_SSH_PORT"
-        log_warn "in your Network Security Group (Azure Portal)."
+        log_warn "AZURE: Also open port $INPUT_SSH_PORT in your NSG."
         log_warn "NSG → Inbound Security Rules → Add"
         echo ""
-        pause
-        ;;
+        pause ;;
     gcp)
         echo ""
-        log_warn "GCP: You must also open port $INPUT_SSH_PORT"
-        log_warn "in VPC Firewall Rules (Google Cloud Console)."
+        log_warn "GCP: Also open port $INPUT_SSH_PORT in VPC Firewall Rules."
         log_warn "VPC Network → Firewall → Create Firewall Rule"
         echo ""
-        pause
-        ;;
+        pause ;;
 esac
 
 log_info "Current firewall state:"
@@ -663,25 +657,24 @@ ufw status verbose
 log_ok "Firewall configured."
 
 # =============================================================================
-# PHASE 5 - SSH HARDENING (SAFE — no lockout risk)
+# PHASE 5 - SSH HARDENING
 #
-# KEY DESIGN DECISION:
-# This phase changes the port and applies hardening settings but does NOT
-# set AllowUsers or disable root login yet. Those restrictions are applied
+# SAFE DESIGN: This phase changes the port and hardens settings but does
+# NOT set AllowUsers or disable root login. Those restrictions are applied
 # in Phase 10 AFTER the new admin account is created and confirmed working.
-# This prevents the lockout issue where AllowUsers blocks the only user
-# that can login before the replacement account exists.
+# This prevents the lockout scenario where restrictions are applied before
+# the replacement account exists and is verified.
 # =============================================================================
 
-log_section "Phase 5 - SSH Hardening (Port Change Only)"
+log_section "Phase 5 - SSH Hardening (Port Change)"
 
 log_warn "Keep your current SSH session open throughout this phase."
-log_info "This phase only changes the port and hardens settings."
-log_info "User restrictions are applied in Phase 10 after your new"
-log_info "admin account is created and tested."
+log_info "This phase changes the port and hardens settings."
+log_info "User restrictions (AllowUsers, PermitRootLogin no) are applied"
+log_info "in Phase 10 after your new admin account is tested."
 pause
 
-log_info "Backing up SSH configuration files..."
+log_info "Backing up SSH configuration..."
 cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
 log_ok "Backed up: /etc/ssh/sshd_config"
 
@@ -706,14 +699,13 @@ if [[ "$AUTH_TYPE" == "key" ]]; then
 # Provider: $CLOUD_PROVIDER | OS: $OS_ID $OS_VERSION
 # Auth: key-only
 #
-# Phase 5 (safe): Port changed, root kept accessible
-# Phase 10 (final): AllowUsers and PermitRootLogin no
-#   applied after new admin account is confirmed.
+# PHASE 5 (safe): Port changed, root kept accessible.
+# PHASE 10 (final): AllowUsers + PermitRootLogin no
+#   applied after new admin account confirmed working.
 # ============================================
 
 Port $INPUT_SSH_PORT
 
-# Root kept accessible until new admin is confirmed in Phase 10
 PermitRootLogin yes
 PasswordAuthentication no
 PubkeyAuthentication yes
@@ -726,10 +718,7 @@ X11Forwarding no
 AllowAgentForwarding no
 AllowTcpForwarding no
 PermitUserEnvironment no
-
-# AllowUsers restriction added in Phase 10
 EOF
-
 else
     cat > /etc/ssh/sshd_config.d/99-hardened.conf << EOF
 # ============================================
@@ -738,9 +727,9 @@ else
 # Provider: $CLOUD_PROVIDER | OS: $OS_ID $OS_VERSION
 # Auth: password
 #
-# Phase 5 (safe): Port changed, root kept accessible
-# Phase 10 (final): AllowUsers and PermitRootLogin no
-#   applied after new admin account is confirmed.
+# PHASE 5 (safe): Port changed, root kept accessible.
+# PHASE 10 (final): AllowUsers + PermitRootLogin no
+#   applied after new admin account confirmed working.
 #
 # To upgrade to key-only auth later:
 #   1. ssh-keygen -t ed25519
@@ -752,7 +741,6 @@ else
 
 Port $INPUT_SSH_PORT
 
-# Root kept accessible until new admin is confirmed in Phase 10
 PermitRootLogin yes
 PasswordAuthentication yes
 PubkeyAuthentication yes
@@ -764,33 +752,15 @@ X11Forwarding no
 AllowAgentForwarding no
 AllowTcpForwarding no
 PermitUserEnvironment no
-
-# AllowUsers restriction added in Phase 10
 EOF
 fi
 
 log_ok "Safe SSH config written."
 
-# Ubuntu 24.04 socket activation fix
-if [[ "$USE_SSH_SOCKET_FIX" == "true" ]]; then
-    log_info "Applying Ubuntu 24.04 SSH socket fix..."
-    log_info "Ubuntu 24.04 uses socket activation which hardcodes port 22."
-    log_info "Disabling the socket lets sshd manage its own port."
-    systemctl stop ssh.socket    2>/dev/null || true
-    systemctl disable ssh.socket 2>/dev/null || true
-    systemctl mask ssh.socket    2>/dev/null || true
-    systemctl enable ssh.service 2>/dev/null || true
-    log_ok "SSH socket activation disabled."
-fi
-
-# Create /run/sshd if missing
-# This directory is required for sshd privilege separation
-# It lives in tmpfs and may not exist after stopping ssh.socket
-if [[ ! -d /run/sshd ]]; then
-    log_info "Creating /run/sshd (required for privilege separation)..."
-    mkdir -p /run/sshd
-    chmod 755 /run/sshd
-    log_ok "/run/sshd created."
+# Apply SSH socket fix on Ubuntu 24.04
+# Always applied on 24.04 — socket may exist even when not showing in list-units
+if [[ "$OS_VERSION" == "24.04" ]]; then
+    apply_ssh_socket_fix
 fi
 
 log_info "Validating SSH config syntax..."
@@ -806,9 +776,20 @@ fi
 log_info "Restarting SSH service..."
 systemctl restart ssh
 
-log_info "Verifying SSH is listening on port $INPUT_SSH_PORT:"
+log_info "Verifying SSH is on port $INPUT_SSH_PORT:"
 ss -tlnp | grep ssh || true
+echo ""
 sshd -T | grep -E 'port|permitrootlogin|passwordauthentication' || true
+
+# Verify SSH is actually on the new port
+if ! ss -tlnp | grep -q ":$INPUT_SSH_PORT"; then
+    log_error "SSH is NOT listening on port $INPUT_SSH_PORT."
+    log_error "Check: systemctl status ssh"
+    log_error "Check: journalctl -u ssh -n 20"
+    exit 1
+fi
+
+log_ok "SSH confirmed listening on port $INPUT_SSH_PORT."
 
 echo ""
 log_warn "═══════════════════════════════════════════════════"
@@ -823,7 +804,7 @@ fi
 log_warn "Keep THIS session open!"
 log_warn "═══════════════════════════════════════════════════"
 echo ""
-read -rp "Did the connection succeed? (yes/no): " SSH_TEST
+read -rp "Did the connection on port $INPUT_SSH_PORT succeed? (yes/no): " SSH_TEST
 
 if [[ "$SSH_TEST" != "yes" ]]; then
     log_error "SSH test failed. Diagnose from this session:"
@@ -836,8 +817,6 @@ fi
 log_info "Removing temporary port 22 rule from UFW..."
 ufw delete allow 22/tcp
 log_ok "Port 22 removed. Only port $INPUT_SSH_PORT is open."
-
-log_info "Final firewall state:"
 ufw status verbose
 
 # =============================================================================
@@ -849,7 +828,7 @@ log_section "Phase 6 - fail2ban"
 log_info "Installing fail2ban..."
 apt install fail2ban -y
 
-log_info "Creating jail.local configuration..."
+log_info "Creating jail.local..."
 cat > /etc/fail2ban/jail.local << EOF
 # ============================================
 # fail2ban Configuration
@@ -857,11 +836,8 @@ cat > /etc/fail2ban/jail.local << EOF
 # ============================================
 
 [DEFAULT]
-# Ban for 24 hours
 bantime  = 86400
-# Look back 20 minutes
 findtime = 1200
-# 3 failures triggers a ban
 maxretry = 3
 
 [sshd]
@@ -876,7 +852,6 @@ systemctl start fail2ban
 
 log_info "fail2ban status:"
 systemctl status fail2ban --no-pager || true
-fail2ban-client status || true
 fail2ban-client status sshd || true
 log_ok "fail2ban configured."
 
@@ -889,12 +864,12 @@ log_section "Phase 7 - AppArmor"
 if command -v aa-status &>/dev/null; then
     log_info "Current AppArmor status:"
     aa-status || true
-    log_info "Installing additional AppArmor profiles..."
+    log_info "Installing additional profiles..."
     apt install apparmor-profiles apparmor-profiles-extra -y
     systemctl status apparmor --no-pager || true
     log_ok "AppArmor configured."
 else
-    log_warn "AppArmor not available on this system. Skipping."
+    log_warn "AppArmor not available. Skipping."
 fi
 
 # =============================================================================
@@ -916,10 +891,7 @@ SystemMaxFileSize=50M
 EOF
 
 systemctl restart systemd-journald
-
-log_info "Verifying persistent logging:"
 journalctl --disk-usage || true
-journalctl --list-boots --no-pager || true
 log_ok "Persistent logging configured."
 
 # =============================================================================
@@ -947,10 +919,10 @@ log_ok "Package cleanup complete."
 # =============================================================================
 # PHASE 10 - ADMIN ACCOUNT + FINAL SSH LOCKDOWN
 #
-# KEY DESIGN DECISION:
-# The new admin account is created and tested FIRST.
-# Only after confirming the new account works do we apply
-# AllowUsers and PermitRootLogin no. This prevents lockouts.
+# SAFE DESIGN: New account is created and tested FIRST.
+# AllowUsers and PermitRootLogin no are only applied AFTER
+# the new account is confirmed working. If the test fails,
+# root access is preserved so you are never locked out.
 # =============================================================================
 
 log_section "Phase 10 - Admin Account + Final SSH Lockdown"
@@ -966,43 +938,41 @@ usermod -aG sudo "$INPUT_USERNAME"
 usermod -aG adm  "$INPUT_USERNAME"
 log_ok "User $INPUT_USERNAME created with sudo and adm groups."
 
-# Copy SSH keys to new admin account
-log_info "Setting up SSH access for new account..."
+# Set up SSH access for new account
+log_info "Setting up SSH access for $INPUT_USERNAME..."
 mkdir -p "/home/$INPUT_USERNAME/.ssh"
 chmod 700 "/home/$INPUT_USERNAME/.ssh"
 
 if [[ "$AUTH_TYPE" == "key" ]]; then
-    # Find where the key is stored for the current user
     KEY_SOURCE=""
     if [[ -f "/root/.ssh/authorized_keys" ]] && \
        [[ -s "/root/.ssh/authorized_keys" ]]; then
         KEY_SOURCE="/root/.ssh/authorized_keys"
-    elif [[ -f "/home/$INPUT_CLOUD_USER/.ssh/authorized_keys" ]] && \
+    elif [[ "$INPUT_CLOUD_USER" != "root" ]] && \
+         [[ -f "/home/$INPUT_CLOUD_USER/.ssh/authorized_keys" ]] && \
          [[ -s "/home/$INPUT_CLOUD_USER/.ssh/authorized_keys" ]]; then
         KEY_SOURCE="/home/$INPUT_CLOUD_USER/.ssh/authorized_keys"
     fi
 
     if [[ -n "$KEY_SOURCE" ]]; then
         cp "$KEY_SOURCE" "/home/$INPUT_USERNAME/.ssh/authorized_keys"
+        chmod 600 "/home/$INPUT_USERNAME/.ssh/authorized_keys"
         log_ok "Keys copied from $KEY_SOURCE"
     elif [[ -n "${INPUT_PUBLIC_KEY:-}" ]]; then
         echo "$INPUT_PUBLIC_KEY" > "/home/$INPUT_USERNAME/.ssh/authorized_keys"
-        log_ok "Public key from Phase 0 installed."
+        chmod 600 "/home/$INPUT_USERNAME/.ssh/authorized_keys"
+        log_ok "Public key from setup installed."
     else
-        log_warn "No SSH key found to copy. Add key manually:"
+        log_warn "No SSH key found. Add key manually later:"
         log_warn "  /home/$INPUT_USERNAME/.ssh/authorized_keys"
     fi
-
-    chmod 600 "/home/$INPUT_USERNAME/.ssh/authorized_keys" 2>/dev/null || true
-
 else
     log_info "Password mode — $INPUT_USERNAME will use password to login."
-    log_info "Add SSH key later: ssh-copy-id -p $INPUT_SSH_PORT $INPUT_USERNAME@server"
 fi
 
 chown -R "$INPUT_USERNAME:$INPUT_USERNAME" "/home/$INPUT_USERNAME/.ssh"
 
-# ─── TEST THE NEW ACCOUNT BEFORE ANY LOCKDOWN ───────────────────────────────
+# ─── TEST BEFORE LOCKDOWN ────────────────────────────────────────────────────
 echo ""
 log_warn "═══════════════════════════════════════════════════"
 log_warn "ACTION REQUIRED: Test your NEW admin account now."
@@ -1016,27 +986,27 @@ else
 fi
 
 echo ""
-echo -e "  Then verify sudo works:"
+echo -e "  Then verify sudo works inside the new session:"
 echo -e "  ${CYAN}sudo -l${NC}"
 echo -e "  ${CYAN}sudo id${NC}"
 echo ""
-log_warn "Keep THIS session open until you confirm the test passes!"
+log_warn "Keep THIS session open until the test passes!"
 log_warn "═══════════════════════════════════════════════════"
 echo ""
-read -rp "New account login and sudo succeeded? (yes/no): " NEW_ACCT_TEST
+read -rp "New account login and sudo both succeeded? (yes/no): " NEW_ACCT_TEST
 
 if [[ "$NEW_ACCT_TEST" != "yes" ]]; then
-    # ── Test failed — do NOT lock down ──────────────────────────────────────
+    # Test failed — preserve access, give instructions
     log_error "═══════════════════════════════════════════════════"
     log_error "Test failed. SSH lockdown NOT applied."
-    log_error "Root access is preserved. You are still connected."
+    log_error "Root access preserved. You are still connected."
     log_error ""
-    log_error "Common fixes:"
-    log_error "  1. Verify password was set:  passwd $INPUT_USERNAME"
-    log_error "  2. Check account exists:     id $INPUT_USERNAME"
-    log_error "  3. Check SSH logs:           journalctl -u ssh -n 20"
+    log_error "Diagnose the issue:"
+    log_error "  id $INPUT_USERNAME"
+    log_error "  passwd $INPUT_USERNAME"
+    log_error "  journalctl -u ssh -n 20 --no-pager"
     log_error ""
-    log_error "Once the new account works, run these to apply lockdown:"
+    log_error "Once fixed, apply lockdown manually:"
     echo ""
     echo -e "  ${CYAN}sudo sed -i 's/PermitRootLogin yes/PermitRootLogin no/' \\${NC}"
     echo -e "  ${CYAN}    /etc/ssh/sshd_config.d/99-hardened.conf${NC}"
@@ -1045,12 +1015,12 @@ if [[ "$NEW_ACCT_TEST" != "yes" ]]; then
     echo -e "  ${CYAN}sudo sshd -t && sudo systemctl restart ssh${NC}"
     echo ""
     log_error "═══════════════════════════════════════════════════"
-    log_warn "Continuing to Phase 11 to set up monitoring."
-    log_warn "SSH is accessible via root on port $INPUT_SSH_PORT."
+    log_warn "Continuing to Phase 11 for monitoring setup."
+    log_warn "SSH accessible via root on port $INPUT_SSH_PORT."
 
 else
-    # ── Test passed — apply final lockdown ──────────────────────────────────
-    log_info "New account confirmed. Applying final SSH restrictions..."
+    # Test passed — apply final lockdown
+    log_info "New account confirmed. Applying final SSH lockdown..."
 
     if [[ "$AUTH_TYPE" == "key" ]]; then
         cat > /etc/ssh/sshd_config.d/99-hardened.conf << EOF
@@ -1078,7 +1048,6 @@ PermitUserEnvironment no
 
 AllowUsers $INPUT_USERNAME
 EOF
-
     else
         cat > /etc/ssh/sshd_config.d/99-hardened.conf << EOF
 # ============================================
@@ -1115,29 +1084,25 @@ EOF
 
     if sshd -t; then
         systemctl restart ssh
-        log_ok "Final SSH config applied."
+        log_ok "Final SSH lockdown applied."
         log_ok "Only '$INPUT_USERNAME' can login. Root login disabled."
     else
-        log_error "SSH config error during final lockdown. Keeping safe config."
-        log_error "Root access preserved. Fix manually:"
-        log_error "  nano /etc/ssh/sshd_config.d/99-hardened.conf"
-        log_error "  sshd -t && systemctl restart ssh"
+        log_error "SSH config error during lockdown. Keeping safe config."
+        log_error "Fix manually: nano /etc/ssh/sshd_config.d/99-hardened.conf"
     fi
 
-    # Demote the original cloud user if it is not root
+    # Demote cloud user if not root
     if [[ "$INPUT_CLOUD_USER" != "root" ]]; then
         log_info "Demoting $INPUT_CLOUD_USER..."
-        deluser "$INPUT_CLOUD_USER" sudo  2>/dev/null || log_warn "Not in sudo group"
-        deluser "$INPUT_CLOUD_USER" lxd   2>/dev/null || log_warn "Not in lxd group"
-        deluser "$INPUT_CLOUD_USER" cdrom 2>/dev/null || log_warn "Not in cdrom group"
-        deluser "$INPUT_CLOUD_USER" dip   2>/dev/null || log_warn "Not in dip group"
-        passwd -l "$INPUT_CLOUD_USER" && log_ok "Locked $INPUT_CLOUD_USER password."
-        passwd -S "$INPUT_CLOUD_USER"
-    else
-        log_info "Current user is root — skipping demotion."
+        deluser "$INPUT_CLOUD_USER" sudo  2>/dev/null || log_warn "Not in sudo"
+        deluser "$INPUT_CLOUD_USER" lxd   2>/dev/null || log_warn "Not in lxd"
+        deluser "$INPUT_CLOUD_USER" cdrom 2>/dev/null || log_warn "Not in cdrom"
+        deluser "$INPUT_CLOUD_USER" dip   2>/dev/null || log_warn "Not in dip"
+        passwd -l "$INPUT_CLOUD_USER"
+        log_ok "$INPUT_CLOUD_USER demoted and locked."
     fi
 
-    # Remove NOPASSWD from cloud user sudoers if present
+    # Remove NOPASSWD if found in sudoers
     SUDOERS_FILE=""
     for F in /etc/sudoers.d/*; do
         if grep -q "$INPUT_CLOUD_USER" "$F" 2>/dev/null; then
@@ -1170,18 +1135,12 @@ AUDIT_LOG="/var/log/${INPUT_HOSTNAME}-audit.log"
 log_info "Creating directory structure..."
 mkdir -p "$SCRIPTS_DIR" "$BASELINE_DIR"
 
-# Create SUID baseline
-# safe_find_suid wrapper prevents set -e from triggering on permission errors
-log_info "Creating SUID baseline snapshot..."
+log_info "Creating SUID baseline..."
 safe_find_suid > "$BASELINE_DIR/suid-baseline.txt"
 chmod 600 "$BASELINE_DIR/suid-baseline.txt"
-log_ok "SUID baseline saved to $BASELINE_DIR/suid-baseline.txt"
-log_info "Baseline contents:"
-cat "$BASELINE_DIR/suid-baseline.txt"
+log_ok "SUID baseline saved: $BASELINE_DIR/suid-baseline.txt"
 
 # Daily audit script
-# Note on escaping: \$ means the variable is evaluated when the audit
-# script runs. Unescaped $VAR is evaluated now and baked into the script.
 log_info "Creating daily audit script..."
 cat > "$SCRIPTS_DIR/daily-audit.sh" << AUDIT_EOF
 #!/bin/bash
@@ -1194,9 +1153,7 @@ echo "========================================" >> \$LOGFILE
 
 echo "--- System Health ---" >> \$LOGFILE
 echo "Uptime: \$(uptime)" >> \$LOGFILE
-echo "Disk Usage:" >> \$LOGFILE
 df -h / >> \$LOGFILE
-echo "Memory:" >> \$LOGFILE
 free -h >> \$LOGFILE
 echo "CPU Load: \$(cat /proc/loadavg)" >> \$LOGFILE
 
@@ -1211,14 +1168,14 @@ echo "--- fail2ban Bans (Last 24h) ---" >> \$LOGFILE
 journalctl -u fail2ban --since "24 hours ago" 2>/dev/null \
     | grep "Ban" >> \$LOGFILE
 
-echo "--- SUID Changes Since Baseline ---" >> \$LOGFILE
+echo "--- SUID Changes ---" >> \$LOGFILE
 find / -perm -4000 -type f 2>/dev/null | grep -v snap | sort \
     > /tmp/current-suid.txt || true
 DIFF=\$(diff $BASELINE_DIR/suid-baseline.txt /tmp/current-suid.txt 2>/dev/null || true)
 if [ -z "\$DIFF" ]; then
-    echo "No changes detected." >> \$LOGFILE
+    echo "No changes." >> \$LOGFILE
 else
-    echo "WARNING: SUID changes detected!" >> \$LOGFILE
+    echo "WARNING: SUID changes!" >> \$LOGFILE
     echo "\$DIFF" >> \$LOGFILE
 fi
 rm -f /tmp/current-suid.txt
@@ -1256,17 +1213,15 @@ echo ""
 
 ALERTS=0
 
-# Disk usage
 DISK=\$(df / | tail -1 | awk '{print \$5}' | tr -d '%')
 if [ "\$DISK" -gt 80 ]; then
-    echo -e "\${RED}[CRITICAL] Disk usage: \${DISK}%\${NC}"; ALERTS=\$((ALERTS+1))
+    echo -e "\${RED}[CRITICAL] Disk: \${DISK}%\${NC}"; ALERTS=\$((ALERTS+1))
 elif [ "\$DISK" -gt 60 ]; then
-    echo -e "\${YELLOW}[WARNING] Disk usage: \${DISK}%\${NC}"; ALERTS=\$((ALERTS+1))
+    echo -e "\${YELLOW}[WARNING] Disk: \${DISK}%\${NC}"; ALERTS=\$((ALERTS+1))
 else
-    echo -e "\${GREEN}[OK] Disk usage: \${DISK}%\${NC}"
+    echo -e "\${GREEN}[OK] Disk: \${DISK}%\${NC}"
 fi
 
-# Memory usage
 MEM=\$(free | grep Mem | awk '{printf "%.0f", \$3/\$2*100}')
 if [ "\$MEM" -gt 90 ]; then
     echo -e "\${RED}[CRITICAL] Memory: \${MEM}%\${NC}"; ALERTS=\$((ALERTS+1))
@@ -1276,62 +1231,55 @@ else
     echo -e "\${GREEN}[OK] Memory: \${MEM}%\${NC}"
 fi
 
-# Failed SSH logins
 FAILED=\$(journalctl -u ssh --since "24 hours ago" 2>/dev/null \
     | grep -c "Invalid user\|Failed password" || echo 0)
 if [ "\$FAILED" -gt 50 ]; then
-    echo -e "\${RED}[CRITICAL] \${FAILED} failed SSH attempts (24h)\${NC}"; ALERTS=\$((ALERTS+1))
+    echo -e "\${RED}[CRITICAL] \${FAILED} failed SSH (24h)\${NC}"; ALERTS=\$((ALERTS+1))
 elif [ "\$FAILED" -gt 10 ]; then
-    echo -e "\${YELLOW}[WARNING] \${FAILED} failed SSH attempts (24h)\${NC}"; ALERTS=\$((ALERTS+1))
+    echo -e "\${YELLOW}[WARNING] \${FAILED} failed SSH (24h)\${NC}"; ALERTS=\$((ALERTS+1))
 else
-    echo -e "\${GREEN}[OK] Failed SSH attempts (24h): \${FAILED}\${NC}"
+    echo -e "\${GREEN}[OK] Failed SSH (24h): \${FAILED}\${NC}"
 fi
 
-# fail2ban bans
 BANS=\$(fail2ban-client status sshd 2>/dev/null \
     | grep "Total banned" | awk '{print \$NF}')
 BANS=\${BANS:-0}
 if [ "\$BANS" -gt 0 ]; then
-    echo -e "\${YELLOW}[INFO] fail2ban has banned \${BANS} IP(s)\${NC}"
+    echo -e "\${YELLOW}[INFO] fail2ban banned \${BANS} IP(s)\${NC}"
     fail2ban-client status sshd 2>/dev/null | grep "Banned IP" | cut -d: -f2
 else
-    echo -e "\${GREEN}[OK] No IPs currently banned\${NC}"
+    echo -e "\${GREEN}[OK] No IPs banned\${NC}"
 fi
 
-# SUID changes
 find / -perm -4000 -type f 2>/dev/null | grep -v snap | sort \
-    > /tmp/current-suid-check.txt || true
+    > /tmp/suid-check.txt || true
 SUID_DIFF=\$(diff $BASELINE_DIR/suid-baseline.txt \
-    /tmp/current-suid-check.txt 2>/dev/null || true)
-rm -f /tmp/current-suid-check.txt
+    /tmp/suid-check.txt 2>/dev/null || true)
+rm -f /tmp/suid-check.txt
 if [ -n "\$SUID_DIFF" ]; then
-    echo -e "\${RED}[CRITICAL] SUID files have changed!\${NC}"
+    echo -e "\${RED}[CRITICAL] SUID files changed!\${NC}"
     echo "\$SUID_DIFF"
     ALERTS=\$((ALERTS+1))
 else
     echo -e "\${GREEN}[OK] SUID files unchanged\${NC}"
 fi
 
-# Service checks
 for SVC in ssh fail2ban; do
     if systemctl is-active --quiet "\$SVC"; then
-        echo -e "\${GREEN}[OK] \$SVC is running\${NC}"
+        echo -e "\${GREEN}[OK] \$SVC running\${NC}"
     else
-        echo -e "\${RED}[CRITICAL] \$SVC is not running!\${NC}"
-        ALERTS=\$((ALERTS+1))
+        echo -e "\${RED}[CRITICAL] \$SVC not running!\${NC}"; ALERTS=\$((ALERTS+1))
     fi
 done
 
-# UFW status
 if ufw status | grep -q "Status: active"; then
-    echo -e "\${GREEN}[OK] UFW firewall is active\${NC}"
+    echo -e "\${GREEN}[OK] UFW active\${NC}"
 else
-    echo -e "\${RED}[CRITICAL] UFW firewall is not active!\${NC}"
-    ALERTS=\$((ALERTS+1))
+    echo -e "\${RED}[CRITICAL] UFW not active!\${NC}"; ALERTS=\$((ALERTS+1))
 fi
 
 echo ""
-echo "--- Currently Listening Ports ---"
+echo "--- Listening Ports ---"
 ss -tlnp | grep LISTEN
 
 echo ""
@@ -1345,7 +1293,6 @@ echo "=========================================="
 echo ""
 ALERT_EOF
 
-# Set permissions
 chmod 750 "$SCRIPTS_DIR/daily-audit.sh"
 chmod 750 "$SCRIPTS_DIR/check-alerts.sh"
 
@@ -1357,23 +1304,20 @@ else
     chown root:root "$SCRIPTS_DIR/check-alerts.sh"
 fi
 
-# Create system-wide command
 ln -sf "$SCRIPTS_DIR/check-alerts.sh" /usr/local/bin/check-alerts
-log_ok "Created system command: check-alerts"
+log_ok "Created system command: sudo check-alerts"
 
-# Schedule daily audit
 log_info "Scheduling daily audit at 4:00 AM..."
 (crontab -l 2>/dev/null | grep -v "daily-audit.sh"; \
  echo "0 4 * * * $SCRIPTS_DIR/daily-audit.sh") | crontab -
 log_ok "Cron job scheduled."
 
-# Test both scripts
-log_info "Running audit script to verify it works..."
+log_info "Running audit script to verify..."
 bash "$SCRIPTS_DIR/daily-audit.sh" || true
 tail -20 "$AUDIT_LOG" || true
 log_ok "Audit script verified."
 
-log_info "Running check-alerts to verify it works..."
+log_info "Running check-alerts to verify..."
 bash "$SCRIPTS_DIR/check-alerts.sh" || true
 log_ok "Alert checker verified."
 
@@ -1407,15 +1351,15 @@ fi
 echo ""
 
 if [[ "$AUTH_TYPE" == "password" ]]; then
-    echo -e "${BOLD}${YELLOW}Upgrade to SSH keys when ready:${NC}"
+    echo -e "${BOLD}${YELLOW}Upgrade to SSH keys later:${NC}"
     echo -e "  ${CYAN}# On your local machine:${NC}"
     echo -e "  ${CYAN}ssh-keygen -t ed25519 -C \"my-vps-key\"${NC}"
     echo -e "  ${CYAN}ssh-copy-id -p $INPUT_SSH_PORT $INPUT_USERNAME@$PUBLIC_IP${NC}"
     echo ""
-    echo -e "  ${CYAN}# On the server, disable passwords:${NC}"
+    echo -e "  ${CYAN}# On the server:${NC}"
     echo -e "  ${CYAN}sudo sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/' \\${NC}"
     echo -e "  ${CYAN}    /etc/ssh/sshd_config.d/99-hardened.conf${NC}"
-    echo -e "  ${CYAN}sudo sed -i '/^$/a AuthenticationMethods publickey' \\${NC}"
+    echo -e "  ${CYAN}sudo sed -i '/PermitEmptyPasswords/i AuthenticationMethods publickey' \\${NC}"
     echo -e "  ${CYAN}    /etc/ssh/sshd_config.d/99-hardened.conf${NC}"
     echo -e "  ${CYAN}sudo sshd -t && sudo systemctl restart ssh${NC}"
     echo ""
@@ -1425,26 +1369,24 @@ echo -e "${BOLD}Key Files:${NC}"
 echo -e "  SSH Config:    /etc/ssh/sshd_config.d/99-hardened.conf"
 echo -e "  fail2ban:      /etc/fail2ban/jail.local"
 echo -e "  Audit Log:     $AUDIT_LOG"
-echo -e "  Audit Script:  $SCRIPTS_DIR/daily-audit.sh"
-echo -e "  Alert Script:  $SCRIPTS_DIR/check-alerts.sh"
+echo -e "  Scripts:       $SCRIPTS_DIR/"
 echo -e "  SUID Baseline: $BASELINE_DIR/suid-baseline.txt"
 echo -e "  Script Log:    $LOGFILE"
 echo ""
 
 echo -e "${BOLD}Daily Commands:${NC}"
-echo -e "  ${CYAN}sudo check-alerts${NC}                    Run security check"
+echo -e "  ${CYAN}sudo check-alerts${NC}                    Security overview"
 echo -e "  ${CYAN}sudo fail2ban-client status sshd${NC}     View banned IPs"
-echo -e "  ${CYAN}sudo ufw status verbose${NC}              View firewall rules"
-echo -e "  ${CYAN}sudo journalctl -u ssh -n 50${NC}         Recent SSH activity"
+echo -e "  ${CYAN}sudo ufw status verbose${NC}              Firewall rules"
+echo -e "  ${CYAN}sudo journalctl -u ssh -n 50${NC}         SSH activity"
 echo -e "  ${CYAN}sudo tail -f $AUDIT_LOG${NC}"
 echo ""
 
 if [[ "$CLOUD_PROVIDER" =~ ^(oracle|aws|azure|gcp)$ ]]; then
-    echo ""
-    log_warn "══════════════════════════════════════════════════════"
-    log_warn "REMINDER: Verify port $INPUT_SSH_PORT is open in your"
-    log_warn "cloud provider's network security console."
-    log_warn "══════════════════════════════════════════════════════"
+    log_warn "═══════════════════════════════════════════════════"
+    log_warn "REMINDER: Verify port $INPUT_SSH_PORT is open in"
+    log_warn "your cloud provider's network security console."
+    log_warn "═══════════════════════════════════════════════════"
 fi
 
-echo -e "\n${BOLD}Full log saved to: $LOGFILE${NC}\n"
+echo -e "\n${BOLD}Full log: $LOGFILE${NC}\n"
