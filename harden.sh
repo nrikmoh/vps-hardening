@@ -1,48 +1,3 @@
-The error is still appearing because the script being run is the **old v3.0**, not the updated v3.1. The file on disk was not replaced. Let me provide the complete corrected script clearly, and also explain exactly what to do.
-
----
-
-## Why This Is Happening
-
-The terminal output shows `v3.0` in the banner and the error is on line 359 — that is the original file. The new script was not saved to disk yet.
-
----
-
-## Fix — Save and Run the New Script
-
-```bash
-# 1. Rename the broken script as a backup
-mv harden.sh harden.sh.v30.bak
-
-# 2. Create the new file
-nano harden.sh
-# Paste the full script below, then Ctrl+O, Enter, Ctrl+X
-
-# 3. Make it executable
-chmod +x harden.sh
-
-# 4. Run it
-sudo ./harden.sh
-```
-
----
-
-## Root Cause of the Line 359 Error
-
-The broken line in v3.0 was:
-
-```bash
-# BROKEN — opening quote missing on /root path, closing quote present
-elif [[ -f /root/.ssh/authorized_keys" ]] && \
-     [[ -s "/root/.ssh/authorized_keys" ]]; then
-#         ↑ no opening quote       ↑ has closing quote = syntax error
-```
-
----
-
-## Complete Fixed Script (v3.1)
-
-```bash
 #!/bin/bash
 # =============================================================================
 # VPS Hardening Script v3.1
@@ -1627,4 +1582,3 @@ echo -e "  ${BOLD}${CYAN}  Happy and secure hosting! 🚀${NC}"
 echo ""
 echo -e "  ${DIM}Full log saved to: $LOGFILE${NC}"
 echo ""
-```
