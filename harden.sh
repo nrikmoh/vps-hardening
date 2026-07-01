@@ -526,6 +526,16 @@ if [[ "$USE_SSH_SOCKET_FIX" == "true" ]]; then
 fi
 
 log_info "Validating SSH config..."
+
+# sshd -t requires /run/sshd to exist for privilege separation
+# On fresh VPS or after stopping ssh.socket this directory may be missing
+if [[ ! -d /run/sshd ]]; then
+    log_info "Creating missing /run/sshd directory..."
+    mkdir -p /run/sshd
+    chmod 755 /run/sshd
+    log_ok "/run/sshd created."
+fi
+
 if sshd -t; then
     log_ok "SSH config valid."
 else
