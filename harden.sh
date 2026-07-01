@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# VPS Hardening Script v3.1
+# VPS Hardening Script v3.2
 # Supports: Ubuntu 20.04, 22.04, 24.04
 # Providers: Oracle Cloud, AWS, DigitalOcean, Hetzner, Linode, Vultr, generic
 # Usage: sudo ./harden.sh
@@ -36,10 +36,7 @@ log_tip()   { echo -e "  ${MAGENTA}💡${NC} $1"; }
 
 # -----------------------------------------------------------------------------
 # spin() — animated spinner tied to a background PID.
-#
-# Receives the exit-code temp file as a third argument so it never relies on
-# wait's return value (which can be wrong when the process exits before the
-# spin loop first calls kill -0, causing the shell to reap it early).
+# Uses an exit-code temp file to avoid race conditions with wait.
 # -----------------------------------------------------------------------------
 spin() {
     local MSG="$1"
@@ -72,10 +69,7 @@ spin() {
 
 # -----------------------------------------------------------------------------
 # run_silent() — runs a command in the background with an animated spinner.
-#
-# The child subshell writes its own exit code to a mktemp file so spin() can
-# read it reliably. With set -e active, a non-zero return propagates to the
-# caller; wrap with || true for steps where failure is acceptable.
+# Sets DEBIAN_FRONTEND=noninteractive to prevent apt prompts from hanging.
 # -----------------------------------------------------------------------------
 run_silent() {
     local MSG="$1"
@@ -83,7 +77,8 @@ run_silent() {
     local EXIT_FILE
     EXIT_FILE=$(mktemp)
 
-    ( "$@" > /dev/null 2>&1; echo $? > "$EXIT_FILE" ) &
+    # DEBIAN_FRONTEND prevents debconf/apt interactive prompts from blocking
+    ( DEBIAN_FRONTEND=noninteractive "$@" > /dev/null 2>&1; echo $? > "$EXIT_FILE" ) &
     local PID=$!
 
     spin "$MSG" "$PID" "$EXIT_FILE"
@@ -92,13 +87,24 @@ run_silent() {
     return "$CODE"
 }
 
+# -----------------------------------------------------------------------------
+# apt_install() — wrapper around apt install that always sets noninteractive
+# and passes the correct flags. Prevents postinstall hook hangs.
+# -----------------------------------------------------------------------------
+apt_install() {
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        "$@" > /dev/null 2>&1
+}
+
 print_banner() {
     clear
     echo ""
     echo -e "${BOLD}${CYAN}"
     echo "  ╔══════════════════════════════════════════════════════════╗"
     echo "  ║                                                          ║"
-    echo "  ║     🛡️   VPS HARDENING SCRIPT  v3.1                     ║"
+    echo "  ║     🛡️   VPS HARDENING SCRIPT  v3.2                     ║"
     echo "  ║     Secure your server in minutes, not hours             ║"
     echo "  ║                                                          ║"
     echo "  ╚══════════════════════════════════════════════════════════╝"
@@ -158,8 +164,6 @@ fi
 # HELPERS
 # =============================================================================
 
-# get_public_ip — tries two well-known endpoints; warns to stderr if both fail
-# so the warning never pollutes the captured return value.
 get_public_ip() {
     local IP
     if IP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null) && [[ -n "$IP" ]]; then
@@ -172,8 +176,6 @@ get_public_ip() {
     fi
 }
 
-# safe_find_suid — finds SUID binaries; warns to stderr if result is empty
-# (empty baseline in containers would cause permanent false positives later).
 safe_find_suid() {
     local RESULT
     RESULT=$(find / -perm -4000 -type f 2>/dev/null | grep -v snap | sort || true)
@@ -183,8 +185,6 @@ safe_find_suid() {
     echo "$RESULT"
 }
 
-# apply_ssh_socket_fix — Ubuntu 24.04 uses socket activation by default;
-# disable it so sshd manages its own port directly.
 apply_ssh_socket_fix() {
     local SOCKET_EXISTS=false
     systemctl list-units   --all 2>/dev/null | grep -q "ssh.socket" && SOCKET_EXISTS=true || true
@@ -205,6 +205,24 @@ apply_ssh_socket_fix() {
         mkdir -p /run/sshd
         chmod 755 /run/sshd
     fi
+}
+
+# -----------------------------------------------------------------------------
+# wait_for_service() — polls until a systemd service is active or times out.
+# Usage: wait_for_service <service_name> [max_seconds]
+# -----------------------------------------------------------------------------
+wait_for_service() {
+    local SVC="$1"
+    local MAX="${2:-15}"
+    local ELAPSED=0
+    while ! systemctl is-active --quiet "$SVC" 2>/dev/null; do
+        sleep 1
+        ELAPSED=$((ELAPSED + 1))
+        if [[ "$ELAPSED" -ge "$MAX" ]]; then
+            return 1
+        fi
+    done
+    return 0
 }
 
 SCRIPT_START=$(date +%s)
@@ -244,8 +262,8 @@ print_phase "0" "Environment Detection" "Analyzing your server before making cha
 
 # --- OS ---
 echo -ne "  ${CYAN}⠋${NC}  Reading OS information"
-OS_ID=$(grep      "^ID="              /etc/os-release | cut -d= -f2 | tr -d '"')
-OS_VERSION=$(grep "^VERSION_ID="      /etc/os-release | cut -d= -f2 | tr -d '"')
+OS_ID=$(grep      "^ID="               /etc/os-release | cut -d= -f2 | tr -d '"')
+OS_VERSION=$(grep "^VERSION_ID="       /etc/os-release | cut -d= -f2 | tr -d '"')
 OS_CODENAME=$(grep "^VERSION_CODENAME=" /etc/os-release | cut -d= -f2 | tr -d '"' 2>/dev/null || echo "unknown")
 sleep 0.3
 echo -e "\r  ${GREEN}✓${NC}  Reading OS information"
@@ -256,9 +274,6 @@ if [[ "$OS_ID" != "ubuntu" ]]; then
     [[ "$CONTINUE_ANYWAY" != "yes" ]] && exit 1
 fi
 
-# Resolve the invoking user safely.
-# SUDO_USER is unset (not empty) when running as actual root without sudo.
-# Guard against the edge case where it is explicitly set to an empty string.
 CURRENT_USER="${SUDO_USER:-}"
 CURRENT_USER="${CURRENT_USER:-root}"
 [[ -z "$CURRENT_USER" ]] && CURRENT_USER="root"
@@ -272,10 +287,10 @@ if systemctl list-units --all 2>/dev/null | grep -q "oracle" \
    || [[ -f /etc/oracle-cloud-agent/agent.yml ]] \
    || curl -sf --max-time 2 -H "Authorization: Bearer Oracle" \
         http://169.254.169.254/opc/v2/instance/ > /dev/null 2>&1; then
-    CLOUD_PROVIDER="oracle";      DEFAULT_CLOUD_USER="ubuntu"
+    CLOUD_PROVIDER="oracle";       DEFAULT_CLOUD_USER="ubuntu"
 elif curl -sf --max-time 2 \
         http://169.254.169.254/latest/meta-data/ami-id > /dev/null 2>&1; then
-    CLOUD_PROVIDER="aws";         DEFAULT_CLOUD_USER="ubuntu"
+    CLOUD_PROVIDER="aws";          DEFAULT_CLOUD_USER="ubuntu"
 elif [[ -f /etc/digitalocean ]] \
      || curl -sf --max-time 2 \
         http://169.254.169.254/metadata/v1/id > /dev/null 2>&1; then
@@ -283,28 +298,26 @@ elif [[ -f /etc/digitalocean ]] \
 elif [[ -f /etc/hetzner-build ]] \
      || curl -sf --max-time 2 \
         http://169.254.169.254/hetzner/v1/metadata > /dev/null 2>&1; then
-    CLOUD_PROVIDER="hetzner";     DEFAULT_CLOUD_USER="root"
+    CLOUD_PROVIDER="hetzner";      DEFAULT_CLOUD_USER="root"
 elif curl -sf --max-time 2 \
         http://169.254.169.254/linode/v1/ > /dev/null 2>&1; then
-    CLOUD_PROVIDER="linode";      DEFAULT_CLOUD_USER="root"
+    CLOUD_PROVIDER="linode";       DEFAULT_CLOUD_USER="root"
 elif curl -sf --max-time 2 \
         http://169.254.169.254/v1.json > /dev/null 2>&1; then
-    CLOUD_PROVIDER="vultr";       DEFAULT_CLOUD_USER="root"
+    CLOUD_PROVIDER="vultr";        DEFAULT_CLOUD_USER="root"
 elif curl -sf --max-time 2 -H "Metadata-Flavor: Google" \
         http://169.254.169.254/computeMetadata/v1/ > /dev/null 2>&1; then
-    CLOUD_PROVIDER="gcp";         DEFAULT_CLOUD_USER="ubuntu"
+    CLOUD_PROVIDER="gcp";          DEFAULT_CLOUD_USER="ubuntu"
 elif curl -sf --max-time 2 -H "Metadata: true" \
         "http://169.254.169.254/metadata/instance?api-version=2021-02-01" \
         > /dev/null 2>&1; then
-    CLOUD_PROVIDER="azure";       DEFAULT_CLOUD_USER="azureuser"
+    CLOUD_PROVIDER="azure";        DEFAULT_CLOUD_USER="azureuser"
 fi
 
 id "$DEFAULT_CLOUD_USER" > /dev/null 2>&1 || DEFAULT_CLOUD_USER="$CURRENT_USER"
 echo -e "\r  ${GREEN}✓${NC}  Detecting cloud provider"
 
 # --- iptables ---
-# Store rule specs (not line numbers) so deletion is safe even if other
-# rules are inserted between detection and deletion.
 echo -ne "  ${CYAN}⠋${NC}  Checking firewall rules"
 CONFLICTING_IPTABLES=false
 CONFLICTING_SPECS=()
@@ -385,7 +398,6 @@ if [[ "$AUTH_METHOD" == "1" ]]; then
     CURRENT_USER_HOME=$(eval echo "~${CURRENT_USER}")
     KEY_FOUND=false
 
-    # Both paths are fully quoted — this was the source of the line 359 error.
     if [[ -f "$CURRENT_USER_HOME/.ssh/authorized_keys" ]] \
        && [[ -s "$CURRENT_USER_HOME/.ssh/authorized_keys" ]]; then
         log_ok "Found authorized_keys in $CURRENT_USER_HOME/.ssh/"
@@ -403,9 +415,6 @@ if [[ "$AUTH_METHOD" == "1" ]]; then
     fi
 
 else
-    # -----------------------------------------------------------------------
-    # Password path — offer to upgrade to SSH key
-    # -----------------------------------------------------------------------
     print_box "SSH KEY RECOMMENDATION" "$YELLOW"
     echo -e "  SSH keys are ${BOLD}far more secure${NC} than passwords:"
     echo ""
@@ -540,7 +549,7 @@ while ! [[ "$INPUT_SSH_PORT" =~ ^[0-9]+$ ]] \
 done
 
 # ---------------------------------------------------------------------------
-# Admin username — allowlist validation + expanded predictable-name blocklist
+# Admin username
 # ---------------------------------------------------------------------------
 print_divider
 echo -e "  ${BOLD}👤 Admin Username${NC}"
@@ -662,9 +671,16 @@ pause
 
 print_phase "2" "System Preparation" "Updating packages and setting hostname"
 
-run_silent "Updating package lists"        apt update -qq
-run_silent "Installing available upgrades" apt upgrade -y -qq
-run_silent "Setting hostname to $INPUT_HOSTNAME" hostnamectl set-hostname "$INPUT_HOSTNAME"
+run_silent "Updating package lists" \
+    bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq'
+
+run_silent "Installing available upgrades" \
+    bash -c 'DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold"'
+
+run_silent "Setting hostname to $INPUT_HOSTNAME" \
+    hostnamectl set-hostname "$INPUT_HOSTNAME"
 
 if [[ "$HAS_CLOUD_INIT" == "true" ]]; then
     echo "preserve_hostname: true" \
@@ -730,27 +746,23 @@ fi
 
 print_phase "4" "Firewall Configuration" "Only allow what you explicitly permit"
 
-run_silent "Installing UFW firewall" apt install ufw -y -qq
+run_silent "Installing UFW firewall" \
+    bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ufw'
 
 ufw default deny incoming  > /dev/null 2>&1
 ufw default allow outgoing > /dev/null 2>&1
 log_ok "Default policy: ${BOLD}deny incoming${NC}, allow outgoing"
 
-# Port 22 stays open as a safety net until Phase 10 confirms the new account
-# works. Closing it here (as v3.0 did in Phase 5) removed the recovery path
-# too early.
-ufw allow 22/tcp               comment "SSH default - safety net" > /dev/null 2>&1
-ufw allow "$INPUT_SSH_PORT"/tcp comment "SSH hardened"             > /dev/null 2>&1
+ufw allow 22/tcp                comment "SSH default - safety net" > /dev/null 2>&1
+ufw allow "$INPUT_SSH_PORT"/tcp comment "SSH hardened"              > /dev/null 2>&1
 log_ok "Opened: 22 ${DIM}(safety net — closed after account confirmed in Phase 10)${NC} and ${BOLD}$INPUT_SSH_PORT${NC}"
 
 echo "y" | ufw enable > /dev/null 2>&1
 log_ok "UFW firewall ${BOLD}${GREEN}active${NC}"
 
-# Delete conflicting iptables rules by rule spec (not line number) to avoid
-# deleting the wrong rule if the table changed between detection and deletion.
 if [[ "$CONFLICTING_IPTABLES" == "true" ]]; then
     for SPEC in "${CONFLICTING_SPECS[@]}"; do
-        # shellcheck disable=SC2086  # intentional word-splitting on rule spec
+        # shellcheck disable=SC2086
         iptables -D INPUT $SPEC 2>/dev/null || true
     done
     mkdir -p /etc/iptables
@@ -779,7 +791,7 @@ case "$CLOUD_PROVIDER" in
 esac
 
 # =============================================================================
-# PHASE 5 — SSH HARDENING (safe config — no user restrictions yet)
+# PHASE 5 — SSH HARDENING
 # =============================================================================
 
 print_phase "5" "SSH Hardening" "Port change + security settings (no lockout risk)"
@@ -800,7 +812,6 @@ run_silent "Backing up SSH configuration" bash -c "
 if [[ "$AUTH_TYPE" == "key" ]]; then
     cat > /etc/ssh/sshd_config.d/99-hardened.conf << EOF
 # Hardened SSH — Phase 5 (safe, no user restrictions yet)
-# AllowUsers + PermitRootLogin no applied in Phase 10.
 Port $INPUT_SSH_PORT
 PermitRootLogin yes
 PasswordAuthentication no
@@ -817,7 +828,6 @@ EOF
 else
     cat > /etc/ssh/sshd_config.d/99-hardened.conf << EOF
 # Hardened SSH — Phase 5 (safe, no user restrictions yet)
-# AllowUsers + PermitRootLogin no applied in Phase 10.
 Port $INPUT_SSH_PORT
 PermitRootLogin yes
 PasswordAuthentication yes
@@ -844,7 +854,6 @@ fi
 
 run_silent "Restarting SSH on port $INPUT_SSH_PORT" systemctl restart ssh
 
-# Poll until SSH is confirmed listening — avoids the fixed sleep 1 race.
 SSH_UP=false
 for _i in {1..20}; do
     if ss -tlnp | grep -q ":$INPUT_SSH_PORT"; then
@@ -886,11 +895,30 @@ log_ok "Port $INPUT_SSH_PORT confirmed — port 22 stays open until Phase 10"
 # =============================================================================
 # PHASE 6 — FAIL2BAN
 # =============================================================================
+#
+# FIX: The original script hung here because:
+#   1. DEBIAN_FRONTEND was unset — debconf could prompt and block apt
+#   2. apt's postinstall hook starts fail2ban immediately during install,
+#      but our jail.local doesn't exist yet — the service start races
+#      with the package install inside the background subshell, causing
+#      dpkg to hang waiting for the service to settle
+#   3. run_silent captured all output to /dev/null so the hang was silent
+#
+# Solution:
+#   1. Write jail.local BEFORE installing the package so fail2ban's
+#      postinstall start uses the correct config immediately
+#   2. Set DEBIAN_FRONTEND=noninteractive via apt_install() wrapper
+#   3. Use --no-start flag (via policy-rc.d) to prevent postinstall from
+#      starting the service, then start it ourselves after verifying config
+#   4. Add wait_for_service() to confirm the service is actually running
+# =============================================================================
 
 print_phase "6" "Brute Force Protection" "fail2ban blocks attackers after 3 failures"
 
-run_silent "Installing fail2ban" apt install fail2ban -y -qq
-
+# Step 1: Write the jail config BEFORE installing the package.
+# This ensures fail2ban's postinstall start uses the correct settings.
+log_step "Writing fail2ban jail configuration"
+mkdir -p /etc/fail2ban
 cat > /etc/fail2ban/jail.local << EOF
 [DEFAULT]
 bantime  = 86400
@@ -903,16 +931,42 @@ port     = $INPUT_SSH_PORT
 logpath  = %(sshd_log)s
 backend  = systemd
 EOF
+log_ok "jail.local written"
 
-systemctl enable fail2ban -q 2>/dev/null || true
-run_silent "Starting fail2ban" systemctl start fail2ban
+# Step 2: Prevent the postinstall script from auto-starting fail2ban.
+# We do this by temporarily installing a policy-rc.d that returns 101
+# (action not allowed), then remove it after the package installs.
+echo "exit 101" > /usr/sbin/policy-rc.d
+chmod +x /usr/sbin/policy-rc.d
 
-BANNED=$(fail2ban-client status sshd 2>/dev/null \
-    | grep "Currently banned" | awk '{print $NF}' || echo "0")
-echo ""
-log_ok "fail2ban active — 3 strikes = 24 h ban"
-[[ "$BANNED" -gt 0 ]] \
-    && log_info "Already banned: ${BOLD}$BANNED IP(s)${NC} from previous attacks"
+run_silent "Installing fail2ban" \
+    bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fail2ban'
+
+# Step 3: Remove the policy block, then enable and start the service ourselves.
+rm -f /usr/sbin/policy-rc.d
+
+run_silent "Enabling fail2ban service" \
+    systemctl enable fail2ban
+
+run_silent "Starting fail2ban" \
+    systemctl start fail2ban
+
+# Step 4: Confirm the service actually came up before proceeding.
+if ! wait_for_service fail2ban 15; then
+    log_error "fail2ban failed to start within 15 seconds."
+    log_info  "Check: journalctl -u fail2ban -n 30"
+    log_info  "Check: fail2ban-client ping"
+    # Not fatal — hardening continues, but warn loudly.
+    log_warn  "Continuing without confirmed fail2ban — investigate after script completes."
+else
+    BANNED=$(fail2ban-client status sshd 2>/dev/null \
+        | grep "Currently banned" | awk '{print $NF}' || echo "0")
+    BANNED="${BANNED:-0}"
+    echo ""
+    log_ok "fail2ban active — 3 strikes = 24 h ban"
+    [[ "$BANNED" -gt 0 ]] \
+        && log_info "Already banned: ${BOLD}$BANNED IP(s)${NC} from previous attacks"
+fi
 
 # =============================================================================
 # PHASE 7 — APPARMOR
@@ -924,7 +978,8 @@ if command -v aa-status > /dev/null 2>&1; then
     PROFILES_BEFORE=$(aa-status 2>/dev/null \
         | grep "profiles are loaded" | awk '{print $1}' || echo "0")
     run_silent "Installing additional AppArmor profiles" \
-        apt install apparmor-profiles apparmor-profiles-extra -y -qq
+        bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            apparmor-profiles apparmor-profiles-extra'
     PROFILES_AFTER=$(aa-status 2>/dev/null \
         | grep "profiles are loaded" | awk '{print $1}' || echo "0")
     ENFORCED=$(aa-status 2>/dev/null \
@@ -975,10 +1030,11 @@ done
 
 if [[ ${#PACKAGES_TO_REMOVE[@]} -gt 0 ]]; then
     run_silent "Removing: ${PACKAGES_TO_REMOVE[*]}" \
-        apt remove "${PACKAGES_TO_REMOVE[@]}" -y -qq
+        bash -c "DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq ${PACKAGES_TO_REMOVE[*]}"
 fi
 
-run_silent "Cleaning up unused dependencies" apt autoremove -y -qq
+run_silent "Cleaning up unused dependencies" \
+    bash -c 'DEBIAN_FRONTEND=noninteractive apt-get autoremove -y -qq'
 
 echo ""
 log_ok "Package cleanup complete — ${#PACKAGES_TO_REMOVE[@]} package(s) removed"
@@ -1010,10 +1066,6 @@ run_silent "Adding $INPUT_USERNAME to sudo and adm groups" bash -c "
 "
 
 # --- SSH key for new account ---
-# Priority:
-#   1. Key the user explicitly pasted (most trustworthy — they typed it in)
-#   2. Cloud user's authorized_keys (same person, expected keys)
-#   3. Root's authorized_keys (with a warning — may include provider keys)
 mkdir -p "/home/$INPUT_USERNAME/.ssh"
 chmod 700 "/home/$INPUT_USERNAME/.ssh"
 
@@ -1087,9 +1139,7 @@ if [[ "$NEW_ACCT_TEST" != "yes" ]]; then
     log_warn "Continuing to Phase 11 without lockdown..."
 
 else
-    # -----------------------------------------------------------------------
-    # Write final hardened SSH config
-    # -----------------------------------------------------------------------
+    # --- Write final hardened SSH config ---
     if [[ "$AUTH_TYPE" == "key" ]]; then
         cat > /etc/ssh/sshd_config.d/99-hardened.conf << EOF
 # Hardened SSH Configuration (FINAL)
@@ -1137,16 +1187,13 @@ EOF
         run_silent "Applying final SSH lockdown" systemctl restart ssh
         log_ok "Root login ${BOLD}disabled${NC} — only ${BOLD}$INPUT_USERNAME${NC} can log in"
 
-        # Close port 22 NOW — confirmed new account works
         ufw delete allow 22/tcp > /dev/null 2>&1 || true
         log_ok "Port 22 closed — only ${BOLD}$INPUT_SSH_PORT${NC} is accessible"
     else
         log_error "SSH config syntax error — keeping safe config, NOT restarting"
     fi
 
-    # -----------------------------------------------------------------------
-    # Demote cloud user
-    # -----------------------------------------------------------------------
+    # --- Demote cloud user ---
     if [[ "$INPUT_CLOUD_USER" != "root" ]]; then
         for GRP in sudo lxd cdrom dip; do
             deluser "$INPUT_CLOUD_USER" "$GRP" 2>/dev/null || true
@@ -1155,10 +1202,7 @@ EOF
         log_ok "$INPUT_CLOUD_USER demoted and account locked"
     fi
 
-    # -----------------------------------------------------------------------
-    # Remove NOPASSWD from cloud user's sudoers — validate with visudo -c
-    # before overwriting so a bad result can never lock out sudo entirely.
-    # -----------------------------------------------------------------------
+    # --- Remove NOPASSWD from cloud user's sudoers ---
     SUDOERS_FILE=""
     for F in /etc/sudoers.d/*; do
         grep -q "$INPUT_CLOUD_USER" "$F" 2>/dev/null && { SUDOERS_FILE="$F"; break; }
@@ -1203,8 +1247,7 @@ SUID_COUNT=$(wc -l < "$BASELINE_DIR/suid-baseline.txt")
 log_ok "SUID baseline: ${BOLD}$SUID_COUNT${NC} privileged binaries tracked"
 
 # ---------------------------------------------------------------------------
-# daily-audit.sh — plain-text log file, designed to run from cron.
-# No colour codes. check-alerts.sh is the interactive companion.
+# daily-audit.sh
 # ---------------------------------------------------------------------------
 cat > "$SCRIPTS_DIR/daily-audit.sh" << AUDIT_EOF
 #!/bin/bash
@@ -1261,12 +1304,7 @@ echo "" >> "\$LOGFILE"
 AUDIT_EOF
 
 # ---------------------------------------------------------------------------
-# check-alerts.sh — interactive dashboard with colour output.
-#
-# The heredoc delimiter is QUOTED ('ALERTS_SCRIPT') so every $VAR inside is
-# a literal runtime variable — no accidental expansion during generation.
-# The two values that must be baked in (BASELINE_DIR, AUDIT_LOG) are written
-# to a separate .check-alerts-env file that the script sources at startup.
+# check-alerts.sh
 # ---------------------------------------------------------------------------
 cat > "$SCRIPTS_DIR/check-alerts.sh" << 'ALERTS_SCRIPT'
 #!/bin/bash
@@ -1282,7 +1320,6 @@ BOLD='\033[1m'
 DIM='\033[2m'
 NC='\033[0m'
 
-# BASELINE_DIR and AUDIT_LOG are baked in via .check-alerts-env
 # shellcheck source=/dev/null
 source "$(dirname "$0")/.check-alerts-env" 2>/dev/null || true
 
@@ -1412,7 +1449,7 @@ fi
 echo ""
 ALERTS_SCRIPT
 
-# Write baked-in values to env file sourced by check-alerts.sh at runtime
+# Write env file sourced by check-alerts.sh
 cat > "$SCRIPTS_DIR/.check-alerts-env" << ENV_EOF
 # Auto-generated by harden.sh — do not edit manually.
 BASELINE_DIR="$BASELINE_DIR"
@@ -1431,8 +1468,7 @@ fi
 
 ln -sf "$SCRIPTS_DIR/check-alerts.sh" /usr/local/bin/check-alerts
 
-# Idempotent cron — only adds the entry if it is not already present,
-# so re-running the script never creates duplicate daily audits.
+# Idempotent cron entry
 CRON_CMD="0 4 * * * $SCRIPTS_DIR/daily-audit.sh"
 ( crontab -l 2>/dev/null || true ) \
     | grep -qF "$SCRIPTS_DIR/daily-audit.sh" \
