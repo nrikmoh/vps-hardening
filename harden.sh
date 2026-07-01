@@ -72,7 +72,13 @@ detect_environment() {
     fi
 
     CLOUD_PROVIDER="generic"
-    DEFAULT_CLOUD_USER="ubuntu"
+    DEFAULT_CLOUD_USER="root"
+
+    # Detect who we are logged in as right now
+    CURRENT_USER="${SUDO_USER:-root}"
+    if [[ "$CURRENT_USER" == "root" ]]; then
+        DEFAULT_CLOUD_USER="root"
+    fi
 
     if systemctl list-units --all 2>/dev/null | grep -q "oracle" || \
        [[ -f /etc/oracle-cloud-agent/agent.yml ]] || \
@@ -116,8 +122,16 @@ detect_environment() {
         DEFAULT_CLOUD_USER="azureuser"
     fi
 
+    # Verify the detected cloud user actually exists
+    if ! id "$DEFAULT_CLOUD_USER" &>/dev/null; then
+        log_warn "Detected cloud user '$DEFAULT_CLOUD_USER' does not exist."
+        DEFAULT_CLOUD_USER="$CURRENT_USER"
+        log_info "Using current user: $DEFAULT_CLOUD_USER"
+    fi
+
     log_info "Cloud provider: $CLOUD_PROVIDER"
     log_info "Default cloud user: $DEFAULT_CLOUD_USER"
+    log_info "Current login user: $CURRENT_USER"
 
     USE_SSH_SOCKET_FIX=false
     if [[ "$OS_VERSION" == "24.04" ]]; then
@@ -184,7 +198,7 @@ log_section "Phase 0 - Configuration"
 echo -e "${BOLD}Environment Summary:${NC}"
 echo -e "  OS:             ${GREEN}$OS_ID $OS_VERSION${NC}"
 echo -e "  Cloud Provider: ${GREEN}$CLOUD_PROVIDER${NC}"
-echo -e "  Default User:   ${GREEN}$DEFAULT_CLOUD_USER${NC}"
+echo -e "  Current User:   ${GREEN}$CURRENT_USER${NC}"
 echo ""
 
 # --- SSH Authentication Method ---
@@ -199,8 +213,6 @@ while [[ "$AUTH_METHOD" != "1" && "$AUTH_METHOD" != "2" ]]; do
     read -rp "Enter 1 or 2: " AUTH_METHOD
 done
 
-# Track what auth the final config will use
-# "key" = key-only, "password" = password stays enabled
 AUTH_TYPE=""
 INPUT_PUBLIC_KEY=""
 
@@ -222,7 +234,6 @@ if [[ "$AUTH_METHOD" == "1" ]]; then
     fi
 
 else
-    # Password user — offer key setup but don't force it
     echo ""
     echo -e "${BOLD}${YELLOW}═══════════════════════════════════════════════════${NC}"
     echo -e "${BOLD}${YELLOW}  SSH KEY RECOMMENDATION${NC}"
@@ -246,7 +257,6 @@ else
     done
 
     if [[ "$KEY_CHOICE" == "a" ]]; then
-        # ── Set up SSH key ──
         AUTH_TYPE="key"
 
         echo ""
@@ -260,41 +270,30 @@ else
         echo -e "    ssh-keygen -t ed25519 -C \"my-vps-key\""
         echo -e "    type \$env:USERPROFILE\\.ssh\\id_ed25519.pub"
         echo ""
-        echo -e "${BOLD}Step 2 — Copy the public key output.${NC}"
-        echo -e "  It looks like: ${CYAN}ssh-ed25519 AAAAC3Nz... my-vps-key${NC}"
-        echo ""
-        echo -e "${BOLD}Step 3 — Paste it below when prompted.${NC}"
-        echo ""
 
-        read -rp "Have you generated the key on your local machine? (yes/no): " KEY_GENERATED
+        read -rp "Have you generated the key? (yes/no): " KEY_GENERATED
 
         if [[ "$KEY_GENERATED" != "yes" ]]; then
             log_error "Generate an SSH key first, then re-run this script."
-            echo -e "  ${CYAN}ssh-keygen -t ed25519 -C \"my-vps-key\"${NC}"
             exit 1
         fi
 
         echo ""
-        echo -e "${BOLD}Paste your PUBLIC key below (the .pub file content):${NC}"
-        echo -e "${YELLOW}(It should start with ssh-ed25519 or ssh-rsa)${NC}"
+        echo -e "${BOLD}Paste your PUBLIC key below (the .pub file):${NC}"
         echo ""
         read -rp "> " INPUT_PUBLIC_KEY
 
         while [[ ! "$INPUT_PUBLIC_KEY" =~ ^ssh-(ed25519|rsa|ecdsa) ]]; do
-            log_warn "That doesn't look like a valid public key."
-            log_warn "It should start with ssh-ed25519, ssh-rsa, or ssh-ecdsa."
-            echo ""
+            log_warn "Invalid key format. Should start with ssh-ed25519, ssh-rsa, or ssh-ecdsa."
             read -rp "Paste your public key: " INPUT_PUBLIC_KEY
         done
 
-        CURRENT_USER="${SUDO_USER:-root}"
         if [[ "$CURRENT_USER" == "root" ]]; then
             KEY_DIR="/root/.ssh"
         else
             KEY_DIR="/home/$CURRENT_USER/.ssh"
         fi
 
-        log_info "Installing public key for user: $CURRENT_USER"
         mkdir -p "$KEY_DIR"
         chmod 700 "$KEY_DIR"
         echo "$INPUT_PUBLIC_KEY" >> "$KEY_DIR/authorized_keys"
@@ -304,34 +303,14 @@ else
         fi
         log_ok "Public key installed to $KEY_DIR/authorized_keys"
 
-        # Test key login
         PUBLIC_IP_EARLY=$(get_public_ip)
         echo ""
-        echo -e "${BOLD}${YELLOW}═══════════════════════════════════════════════════${NC}"
-        echo -e "${BOLD}${YELLOW}  TEST YOUR KEY LOGIN NOW${NC}"
-        echo -e "${BOLD}${YELLOW}═══════════════════════════════════════════════════${NC}"
-        echo ""
-        echo -e "Open a ${BOLD}NEW terminal${NC} on your local machine and run:"
-        echo ""
-        echo -e "  ${CYAN}Mac/Linux:${NC}"
-        echo -e "    ssh -i ~/.ssh/id_ed25519 $CURRENT_USER@$PUBLIC_IP_EARLY"
-        echo ""
-        echo -e "  ${CYAN}Windows:${NC}"
-        echo -e "    ssh -i \$env:USERPROFILE\\.ssh\\id_ed25519 $CURRENT_USER@$PUBLIC_IP_EARLY"
-        echo ""
-        echo -e "If it connects ${GREEN}without asking for a password${NC}, the key works."
-        echo -e "${RED}Keep THIS session open!${NC}"
+        echo -e "${BOLD}Test key login now. Open a NEW terminal:${NC}"
+        echo -e "  ${CYAN}ssh -i ~/.ssh/id_ed25519 $CURRENT_USER@$PUBLIC_IP_EARLY${NC}"
         echo ""
         read -rp "Did the SSH key login succeed? (yes/no): " KEY_TEST
 
         if [[ "$KEY_TEST" != "yes" ]]; then
-            log_error "Key login failed. Common fixes:"
-            echo ""
-            echo -e "  1. Make sure you copied the ${BOLD}.pub${NC} file (public key)"
-            echo -e "  2. Check: ${CYAN}cat $KEY_DIR/authorized_keys${NC}"
-            echo -e "  3. Debug: ${CYAN}ssh -vvv -i ~/.ssh/id_ed25519 $CURRENT_USER@$PUBLIC_IP_EARLY${NC}"
-            echo ""
-
             echo -e "${YELLOW}Would you like to continue with password-only instead? (yes/no)${NC}"
             read -rp "> " FALLBACK_PASSWORD
             if [[ "$FALLBACK_PASSWORD" == "yes" ]]; then
@@ -342,16 +321,11 @@ else
                 exit 1
             fi
         fi
-
     else
-        # ── Continue with password only ──
         AUTH_TYPE="password"
         echo ""
         log_warn "Continuing with password authentication."
-        log_warn "Password login will remain enabled."
-        log_warn "You can set up SSH keys later and manually edit:"
-        log_warn "  /etc/ssh/sshd_config.d/99-hardened.conf"
-        log_warn "  Change: PasswordAuthentication yes → no"
+        log_warn "You can set up SSH keys later for stronger security."
         echo ""
     fi
 fi
@@ -380,16 +354,19 @@ while [[ -z "$INPUT_USERNAME" || \
     read -rp "Enter new admin username: " INPUT_USERNAME
 done
 
-# Cloud user
-read -rp "Default cloud username to demote [$DEFAULT_CLOUD_USER]: " INPUT_CLOUD_USER
-INPUT_CLOUD_USER="${INPUT_CLOUD_USER:-$DEFAULT_CLOUD_USER}"
+# Cloud user - only ask if not root
+INPUT_CLOUD_USER="$CURRENT_USER"
+if [[ "$CURRENT_USER" != "root" ]]; then
+    read -rp "Default cloud username to demote [$CURRENT_USER]: " INPUT_CLOUD_USER
+    INPUT_CLOUD_USER="${INPUT_CLOUD_USER:-$CURRENT_USER}"
+fi
 
 echo ""
 echo -e "${BOLD}Configuration Summary:${NC}"
 echo -e "  Hostname:             ${GREEN}$INPUT_HOSTNAME${NC}"
 echo -e "  SSH Port:             ${GREEN}$INPUT_SSH_PORT${NC}"
 echo -e "  New Admin User:       ${GREEN}$INPUT_USERNAME${NC}"
-echo -e "  Cloud User:           ${GREEN}$INPUT_CLOUD_USER${NC}"
+echo -e "  Current User:         ${GREEN}$INPUT_CLOUD_USER${NC}"
 echo -e "  Auth Method:          ${GREEN}$AUTH_TYPE${NC}"
 echo -e "  Provider:             ${GREEN}$CLOUD_PROVIDER${NC}"
 echo -e "  Ubuntu 24.04 SSH fix: ${GREEN}$USE_SSH_SOCKET_FIX${NC}"
@@ -398,7 +375,7 @@ echo -e "  Fix iptables:         ${GREEN}$CONFLICTING_IPTABLES${NC}"
 if [[ "$AUTH_TYPE" == "password" ]]; then
     echo ""
     echo -e "  ${YELLOW}⚠ Password auth will remain enabled.${NC}"
-    echo -e "  ${YELLOW}  SSH hardening will still apply (port change, rate limits, etc.)${NC}"
+    echo -e "  ${YELLOW}  SSH hardening will still apply (port, rate limits, etc.)${NC}"
 fi
 
 echo ""
@@ -564,15 +541,12 @@ if [[ "$CONFLICTING_IPTABLES" == "true" ]]; then
     log_info "Removing conflicting iptables rules: ${CONFLICTING_LINES[*]}"
     mapfile -t SORTED_LINES < <(printf '%s\n' "${CONFLICTING_LINES[@]}" | sort -rn)
     for LINE_NUM in "${SORTED_LINES[@]}"; do
-        log_info "Deleting INPUT rule #$LINE_NUM"
         if iptables -D INPUT "$LINE_NUM" 2>/dev/null; then
             log_ok "Deleted rule $LINE_NUM"
         else
-            log_warn "Could not delete rule $LINE_NUM (may have shifted)"
+            log_warn "Could not delete rule $LINE_NUM"
         fi
     done
-    log_info "iptables after cleanup:"
-    iptables -L INPUT -n --line-numbers || true
     mkdir -p /etc/iptables
     sh -c 'iptables-save > /etc/iptables/rules.v4'
     log_ok "Saved clean iptables rules."
@@ -583,19 +557,15 @@ fi
 case "$CLOUD_PROVIDER" in
     oracle)
         log_warn "ORACLE: Also open port $INPUT_SSH_PORT in Security Lists."
-        log_warn "VCN → Subnet → Security List → Add Ingress Rule"
         pause ;;
     aws)
-        log_warn "AWS: Also open port $INPUT_SSH_PORT in your EC2 Security Group."
-        log_warn "EC2 → Security Groups → Inbound Rules → Add Rule"
+        log_warn "AWS: Also open port $INPUT_SSH_PORT in EC2 Security Group."
         pause ;;
     azure)
         log_warn "AZURE: Also open port $INPUT_SSH_PORT in your NSG."
-        log_warn "NSG → Inbound Security Rules → Add"
         pause ;;
     gcp)
         log_warn "GCP: Also open port $INPUT_SSH_PORT in VPC Firewall Rules."
-        log_warn "VPC Network → Firewall → Create Firewall Rule"
         pause ;;
 esac
 
@@ -604,12 +574,14 @@ ufw status verbose
 log_ok "Firewall configured."
 
 # =============================================================================
-# PHASE 5 - SSH HARDENING
+# PHASE 5 - SSH HARDENING (SAFE — port change only, no lockout risk)
 # =============================================================================
 
-log_section "Phase 5 - SSH Hardening"
+log_section "Phase 5 - SSH Hardening (Port Change)"
 
 log_warn "Keep your current SSH session open throughout this phase."
+log_info "This phase ONLY changes the port and applies safe settings."
+log_info "User restrictions happen AFTER the new admin account is tested."
 pause
 
 log_info "Backing up SSH configs..."
@@ -625,28 +597,25 @@ fi
 
 mkdir -p /etc/ssh/sshd_config.d
 
-log_info "Writing hardened SSH config..."
-
-# Determine who to allow initially
-# If cloud user is root and we're creating a new user,
-# allow root temporarily until new user is confirmed
-INITIAL_ALLOW_USERS="$INPUT_CLOUD_USER"
-if [[ "$INPUT_CLOUD_USER" == "root" ]]; then
-    INITIAL_ALLOW_USERS="root"
-fi
+# SAFE CONFIG: Change port, harden settings, but keep current access working
+# AllowUsers and PermitRootLogin restrictions are applied LATER in Phase 10
+# after the new admin account is created and confirmed
+log_info "Writing safe SSH config (port change + hardening, no user lockout)..."
 
 if [[ "$AUTH_TYPE" == "key" ]]; then
     cat > /etc/ssh/sshd_config.d/99-hardened.conf << EOF
 # ============================================
-# Hardened SSH Configuration
+# Hardened SSH Configuration (Phase 5 — safe)
 # Generated: $(date)
 # Provider: $CLOUD_PROVIDER | OS: $OS_ID $OS_VERSION
-# Auth: key-only
+# NOTE: User restrictions applied in Phase 10 after
+#       new admin account is created and confirmed.
 # ============================================
 
 Port $INPUT_SSH_PORT
 
-PermitRootLogin no
+# Keep root login until new admin is confirmed
+PermitRootLogin yes
 PasswordAuthentication no
 PubkeyAuthentication yes
 AuthenticationMethods publickey
@@ -659,18 +628,16 @@ AllowAgentForwarding no
 AllowTcpForwarding no
 PermitUserEnvironment no
 
-AllowUsers $INITIAL_ALLOW_USERS
+# No AllowUsers restriction yet — applied after Phase 10
 EOF
-    log_ok "Key-only SSH config written."
-
 else
-    # Password mode — still harden everything except auth method
     cat > /etc/ssh/sshd_config.d/99-hardened.conf << EOF
 # ============================================
-# Hardened SSH Configuration
+# Hardened SSH Configuration (Phase 5 — safe)
 # Generated: $(date)
 # Provider: $CLOUD_PROVIDER | OS: $OS_ID $OS_VERSION
-# Auth: password (key recommended — see comments below)
+# NOTE: User restrictions applied in Phase 10 after
+#       new admin account is created and confirmed.
 # ============================================
 
 # To switch to key-only auth later:
@@ -682,7 +649,8 @@ else
 
 Port $INPUT_SSH_PORT
 
-PermitRootLogin no
+# Keep root login until new admin is confirmed
+PermitRootLogin yes
 PasswordAuthentication yes
 PubkeyAuthentication yes
 PermitEmptyPasswords no
@@ -694,13 +662,11 @@ AllowAgentForwarding no
 AllowTcpForwarding no
 PermitUserEnvironment no
 
-AllowUsers $INITIAL_ALLOW_USERS
+# No AllowUsers restriction yet — applied after Phase 10
 EOF
-    log_warn "Password-enabled SSH config written."
-    log_warn "SSH is hardened but password login remains enabled."
 fi
 
-log_ok "Created 99-hardened.conf"
+log_ok "Safe SSH config written (no user lockout possible)."
 
 if [[ "$USE_SSH_SOCKET_FIX" == "true" ]]; then
     log_info "Applying Ubuntu 24.04 SSH socket fix..."
@@ -714,7 +680,6 @@ fi
 log_info "Validating SSH config..."
 
 if [[ ! -d /run/sshd ]]; then
-    log_info "Creating missing /run/sshd directory..."
     mkdir -p /run/sshd
     chmod 755 /run/sshd
     log_ok "/run/sshd created."
@@ -733,16 +698,16 @@ systemctl restart ssh
 
 log_info "SSH listening on:"
 ss -tlnp | grep ssh || true
-sshd -T | grep -E 'port|permitrootlogin|passwordauthentication|allowusers' || true
+sshd -T | grep -E 'port|permitrootlogin|passwordauthentication' || true
 
 echo ""
 log_warn "═══════════════════════════════════════════════════"
 log_warn "ACTION: Open a NEW terminal and test SSH connection:"
 
 if [[ "$AUTH_TYPE" == "key" ]]; then
-    echo -e "  ${CYAN}ssh -i /path/to/key -p $INPUT_SSH_PORT $INPUT_CLOUD_USER@$PUBLIC_IP${NC}"
+    echo -e "  ${CYAN}ssh -i /path/to/key -p $INPUT_SSH_PORT $CURRENT_USER@$PUBLIC_IP${NC}"
 else
-    echo -e "  ${CYAN}ssh -p $INPUT_SSH_PORT $INPUT_CLOUD_USER@$PUBLIC_IP${NC}"
+    echo -e "  ${CYAN}ssh -p $INPUT_SSH_PORT $CURRENT_USER@$PUBLIC_IP${NC}"
 fi
 
 log_warn "Keep THIS session open!"
@@ -771,11 +736,6 @@ log_section "Phase 6 - fail2ban"
 apt install fail2ban -y
 
 cat > /etc/fail2ban/jail.local << EOF
-# ============================================
-# fail2ban Configuration
-# Generated: $(date)
-# ============================================
-
 [DEFAULT]
 bantime  = 86400
 findtime = 1200
@@ -793,7 +753,6 @@ systemctl start fail2ban
 
 log_info "fail2ban status:"
 systemctl status fail2ban --no-pager || true
-fail2ban-client status || true
 fail2ban-client status sshd || true
 log_ok "fail2ban configured."
 
@@ -804,10 +763,8 @@ log_ok "fail2ban configured."
 log_section "Phase 7 - AppArmor"
 
 if command -v aa-status &>/dev/null; then
-    log_info "Current AppArmor status:"
     aa-status || true
     apt install apparmor-profiles apparmor-profiles-extra -y
-    systemctl status apparmor --no-pager || true
     log_ok "AppArmor configured."
 else
     log_warn "AppArmor not available. Skipping."
@@ -832,7 +789,6 @@ EOF
 
 systemctl restart systemd-journald
 journalctl --disk-usage || true
-journalctl --list-boots --no-pager || true
 log_ok "Persistent logging configured."
 
 # =============================================================================
@@ -847,7 +803,7 @@ for PKG in nfs-common open-iscsi ssh-import-id; do
         PACKAGES_TO_REMOVE+=("$PKG")
         log_info "Will remove: $PKG"
     else
-        log_info "Not installed, skipping: $PKG"
+        log_info "Not installed: $PKG"
     fi
 done
 
@@ -857,48 +813,12 @@ fi
 apt autoremove -y
 log_ok "Package cleanup done."
 
-log_info "Current SUID binaries (review this list):"
-find / -perm -4000 -type f 2>/dev/null | grep -v snap | sort
-
 # =============================================================================
-# PHASE 10 - ADMIN ACCOUNT SETUP
+# PHASE 10 - ADMIN ACCOUNT + FINAL SSH LOCKDOWN
+# This is where user restrictions are applied — AFTER account is tested
 # =============================================================================
 
-log_section "Phase 10 - Admin Account Setup"
-
-if [[ "$INPUT_CLOUD_USER" == "root" ]]; then
-    log_info "Cloud user is root. Skipping demotion."
-    DEMOTE_CLOUD_USER=false
-else
-    DEMOTE_CLOUD_USER=true
-fi
-
-if [[ "$DEMOTE_CLOUD_USER" == "true" ]]; then
-    log_info "Setting password on $INPUT_CLOUD_USER..."
-    passwd "$INPUT_CLOUD_USER"
-
-    log_info "Removing NOPASSWD from $INPUT_CLOUD_USER..."
-    SUDOERS_FILE=""
-    for F in /etc/sudoers.d/*; do
-        if grep -q "$INPUT_CLOUD_USER" "$F" 2>/dev/null; then
-            SUDOERS_FILE="$F"
-            break
-        fi
-    done
-
-    if [[ -n "$SUDOERS_FILE" ]]; then
-        cp "$SUDOERS_FILE" "${SUDOERS_FILE}.backup"
-        sed -i \
-            "s/${INPUT_CLOUD_USER} ALL=(ALL) NOPASSWD:ALL/${INPUT_CLOUD_USER} ALL=(ALL) ALL/" \
-            "$SUDOERS_FILE"
-        sed -i \
-            "s/${INPUT_CLOUD_USER} ALL=(ALL:ALL) NOPASSWD:ALL/${INPUT_CLOUD_USER} ALL=(ALL:ALL) ALL/" \
-            "$SUDOERS_FILE"
-        log_ok "Removed NOPASSWD from $INPUT_CLOUD_USER"
-    else
-        log_warn "No sudoers file found for $INPUT_CLOUD_USER. Check manually."
-    fi
-fi
+log_section "Phase 10 - Admin Account + Final SSH Lockdown"
 
 log_info "Creating admin account: $INPUT_USERNAME"
 if id "$INPUT_USERNAME" &>/dev/null; then
@@ -909,14 +829,15 @@ fi
 
 usermod -aG sudo "$INPUT_USERNAME"
 usermod -aG adm  "$INPUT_USERNAME"
-log_ok "Groups assigned."
+log_ok "User $INPUT_USERNAME created with sudo and adm groups."
 
 # Copy SSH keys to new admin account
 log_info "Setting up SSH access for $INPUT_USERNAME..."
 mkdir -p "/home/$INPUT_USERNAME/.ssh"
 
 KEY_SOURCE=""
-if [[ -f "/home/$INPUT_CLOUD_USER/.ssh/authorized_keys" ]]; then
+if [[ -f "/home/$INPUT_CLOUD_USER/.ssh/authorized_keys" ]] && \
+   [[ "$INPUT_CLOUD_USER" != "root" ]]; then
     KEY_SOURCE="/home/$INPUT_CLOUD_USER/.ssh/authorized_keys"
 elif [[ -f "/root/.ssh/authorized_keys" ]]; then
     KEY_SOURCE="/root/.ssh/authorized_keys"
@@ -935,31 +856,10 @@ elif [[ "$AUTH_TYPE" == "key" && -n "${INPUT_PUBLIC_KEY:-}" ]]; then
     chmod 600 "/home/$INPUT_USERNAME/.ssh/authorized_keys"
     log_ok "Public key installed for $INPUT_USERNAME"
 elif [[ "$AUTH_TYPE" == "password" ]]; then
-    log_info "Password auth mode — $INPUT_USERNAME will use password to login."
-    log_info "SSH key can be added later with: ssh-copy-id -p $INPUT_SSH_PORT $INPUT_USERNAME@server"
-else
-    log_warn "No authorized_keys found. Add your key manually."
+    log_info "Password mode — $INPUT_USERNAME will use password to login."
 fi
 
-# Update AllowUsers to new admin account
-log_info "Updating SSH AllowUsers to $INPUT_USERNAME..."
-sed -i "s/AllowUsers.*/AllowUsers $INPUT_USERNAME/" \
-    /etc/ssh/sshd_config.d/99-hardened.conf
-
-# For password mode, also ensure PermitRootLogin is no but user can login with password
-if [[ "$AUTH_TYPE" == "password" ]]; then
-    # Make sure the new user's password works for SSH
-    log_info "Password auth mode: ensuring new account can login via password."
-fi
-
-if sshd -t; then
-    systemctl restart ssh
-    log_ok "SSH restarted with updated AllowUsers."
-else
-    log_error "SSH config error after AllowUsers update."
-    exit 1
-fi
-
+# ─── TEST THE NEW ACCOUNT BEFORE LOCKING ANYTHING ───
 echo ""
 log_warn "═══════════════════════════════════════════════════"
 log_warn "ACTION: Test login with your NEW account:"
@@ -978,21 +878,116 @@ echo ""
 read -rp "New account login and sudo succeeded? (yes/no): " NEW_ACCT_TEST
 
 if [[ "$NEW_ACCT_TEST" != "yes" ]]; then
-    log_error "Test failed. Do NOT demote $INPUT_CLOUD_USER yet."
-    log_error "Fix the issue from your current session."
+    log_error "═══════════════════════════════════════════════════"
+    log_error "New account test failed."
+    log_error "SSH config is NOT locked down. Root access preserved."
+    log_error "Fix the issue, then manually run these commands:"
+    echo ""
+    echo -e "  ${CYAN}# After fixing the new account, apply lockdown:${NC}"
+    echo -e "  ${CYAN}sudo sed -i 's/PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config.d/99-hardened.conf${NC}"
+    echo -e "  ${CYAN}echo 'AllowUsers $INPUT_USERNAME' | sudo tee -a /etc/ssh/sshd_config.d/99-hardened.conf${NC}"
+    echo -e "  ${CYAN}sudo sshd -t && sudo systemctl restart ssh${NC}"
+    echo ""
+    log_error "═══════════════════════════════════════════════════"
+    log_warn "Continuing with remaining phases (monitoring setup)."
+    log_warn "SSH is still accessible via root on port $INPUT_SSH_PORT."
 else
-    # Demote cloud user
-    if [[ "$DEMOTE_CLOUD_USER" == "true" ]]; then
-        log_info "Demoting $INPUT_CLOUD_USER..."
-        deluser "$INPUT_CLOUD_USER" sudo  2>/dev/null || log_warn "Not in sudo group"
-        deluser "$INPUT_CLOUD_USER" lxd   2>/dev/null || log_warn "Not in lxd group"
-        deluser "$INPUT_CLOUD_USER" cdrom 2>/dev/null || log_warn "Not in cdrom group"
-        deluser "$INPUT_CLOUD_USER" dip   2>/dev/null || log_warn "Not in dip group"
+    # ─── NEW ACCOUNT WORKS — NOW APPLY FINAL LOCKDOWN ───
+    log_info "New account confirmed. Applying final SSH lockdown..."
 
-        log_info "Locking $INPUT_CLOUD_USER password..."
+    if [[ "$AUTH_TYPE" == "key" ]]; then
+        cat > /etc/ssh/sshd_config.d/99-hardened.conf << EOF
+# ============================================
+# Hardened SSH Configuration (FINAL)
+# Generated: $(date)
+# Provider: $CLOUD_PROVIDER | OS: $OS_ID $OS_VERSION
+# Auth: key-only (password disabled)
+# ============================================
+
+Port $INPUT_SSH_PORT
+
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+PermitEmptyPasswords no
+MaxAuthTries 3
+LoginGraceTime 30
+
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+PermitUserEnvironment no
+
+AllowUsers $INPUT_USERNAME
+EOF
+    else
+        cat > /etc/ssh/sshd_config.d/99-hardened.conf << EOF
+# ============================================
+# Hardened SSH Configuration (FINAL)
+# Generated: $(date)
+# Provider: $CLOUD_PROVIDER | OS: $OS_ID $OS_VERSION
+# Auth: password (key recommended)
+# ============================================
+
+# To switch to key-only auth later:
+#   1. ssh-keygen -t ed25519
+#   2. ssh-copy-id -p $INPUT_SSH_PORT $INPUT_USERNAME@server
+#   3. Change PasswordAuthentication to "no"
+#   4. Add: AuthenticationMethods publickey
+#   5. sudo sshd -t && sudo systemctl restart ssh
+
+Port $INPUT_SSH_PORT
+
+PermitRootLogin no
+PasswordAuthentication yes
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+MaxAuthTries 3
+LoginGraceTime 30
+
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+PermitUserEnvironment no
+
+AllowUsers $INPUT_USERNAME
+EOF
+    fi
+
+    if sshd -t; then
+        systemctl restart ssh
+        log_ok "Final SSH lockdown applied."
+        log_ok "Only $INPUT_USERNAME can login. Root login disabled."
+    else
+        log_error "SSH config error during final lockdown."
+        log_error "Root access preserved for safety."
+    fi
+
+    # Demote cloud user
+    if [[ "$INPUT_CLOUD_USER" != "root" ]]; then
+        log_info "Demoting $INPUT_CLOUD_USER..."
+        deluser "$INPUT_CLOUD_USER" sudo  2>/dev/null || log_warn "Not in sudo"
+        deluser "$INPUT_CLOUD_USER" lxd   2>/dev/null || log_warn "Not in lxd"
+        deluser "$INPUT_CLOUD_USER" cdrom 2>/dev/null || log_warn "Not in cdrom"
+        deluser "$INPUT_CLOUD_USER" dip   2>/dev/null || log_warn "Not in dip"
         passwd -l "$INPUT_CLOUD_USER"
-        passwd -S "$INPUT_CLOUD_USER"
         log_ok "Cloud account demoted and locked."
+    fi
+
+    # Remove NOPASSWD from cloud user if sudoers file exists
+    SUDOERS_FILE=""
+    for F in /etc/sudoers.d/*; do
+        if grep -q "$INPUT_CLOUD_USER" "$F" 2>/dev/null; then
+            SUDOERS_FILE="$F"
+            break
+        fi
+    done
+    if [[ -n "$SUDOERS_FILE" ]]; then
+        cp "$SUDOERS_FILE" "${SUDOERS_FILE}.backup"
+        sed -i "s/${INPUT_CLOUD_USER} ALL=(ALL) NOPASSWD:ALL/${INPUT_CLOUD_USER} ALL=(ALL) ALL/" "$SUDOERS_FILE"
+        sed -i "s/${INPUT_CLOUD_USER} ALL=(ALL:ALL) NOPASSWD:ALL/${INPUT_CLOUD_USER} ALL=(ALL:ALL) ALL/" "$SUDOERS_FILE"
+        log_ok "Removed NOPASSWD from $INPUT_CLOUD_USER"
     fi
 fi
 
@@ -1026,9 +1021,7 @@ echo "========================================" >> \$LOGFILE
 
 echo "--- System Health ---" >> \$LOGFILE
 echo "Uptime: \$(uptime)" >> \$LOGFILE
-echo "Disk Usage:" >> \$LOGFILE
 df -h / >> \$LOGFILE
-echo "Memory Usage:" >> \$LOGFILE
 free -h >> \$LOGFILE
 echo "CPU Load: \$(cat /proc/loadavg)" >> \$LOGFILE
 
@@ -1043,14 +1036,14 @@ echo "--- fail2ban Bans (Last 24h) ---" >> \$LOGFILE
 journalctl -u fail2ban --since "24 hours ago" 2>/dev/null \
     | grep "Ban" >> \$LOGFILE
 
-echo "--- SUID Files (Changes Since Baseline) ---" >> \$LOGFILE
+echo "--- SUID Changes ---" >> \$LOGFILE
 find / -perm -4000 -type f 2>/dev/null | grep -v snap | sort \
     > /tmp/current-suid.txt
 DIFF=\$(diff $BASELINE_DIR/suid-baseline.txt /tmp/current-suid.txt)
 if [ -z "\$DIFF" ]; then
-    echo "No changes detected." >> \$LOGFILE
+    echo "No changes." >> \$LOGFILE
 else
-    echo "WARNING: SUID changes detected!" >> \$LOGFILE
+    echo "WARNING: SUID changes!" >> \$LOGFILE
     echo "\$DIFF" >> \$LOGFILE
 fi
 rm /tmp/current-suid.txt
@@ -1089,47 +1082,39 @@ ALERTS=0
 
 DISK=\$(df / | tail -1 | awk '{print \$5}' | tr -d '%')
 if [ "\$DISK" -gt 80 ]; then
-    echo -e "\${RED}[CRITICAL] Disk usage is \${DISK}%!\${NC}"
-    ALERTS=\$((ALERTS + 1))
+    echo -e "\${RED}[CRITICAL] Disk \${DISK}%\${NC}"; ALERTS=\$((ALERTS+1))
 elif [ "\$DISK" -gt 60 ]; then
-    echo -e "\${YELLOW}[WARNING] Disk usage is \${DISK}%.\${NC}"
-    ALERTS=\$((ALERTS + 1))
+    echo -e "\${YELLOW}[WARNING] Disk \${DISK}%\${NC}"; ALERTS=\$((ALERTS+1))
 else
-    echo -e "\${GREEN}[OK] Disk usage: \${DISK}%\${NC}"
+    echo -e "\${GREEN}[OK] Disk \${DISK}%\${NC}"
 fi
 
-MEM=\$(free | grep Mem | awk '{printf "%.0f", \$3/\$2 * 100}')
+MEM=\$(free | grep Mem | awk '{printf "%.0f", \$3/\$2*100}')
 if [ "\$MEM" -gt 90 ]; then
-    echo -e "\${RED}[CRITICAL] Memory usage is \${MEM}%!\${NC}"
-    ALERTS=\$((ALERTS + 1))
+    echo -e "\${RED}[CRITICAL] Memory \${MEM}%\${NC}"; ALERTS=\$((ALERTS+1))
 elif [ "\$MEM" -gt 75 ]; then
-    echo -e "\${YELLOW}[WARNING] Memory usage is \${MEM}%.\${NC}"
-    ALERTS=\$((ALERTS + 1))
+    echo -e "\${YELLOW}[WARNING] Memory \${MEM}%\${NC}"; ALERTS=\$((ALERTS+1))
 else
-    echo -e "\${GREEN}[OK] Memory usage: \${MEM}%\${NC}"
+    echo -e "\${GREEN}[OK] Memory \${MEM}%\${NC}"
 fi
 
 FAILED=\$(journalctl -u ssh --since "24 hours ago" 2>/dev/null \
     | grep -c "Invalid user\|Failed password" || echo 0)
 if [ "\$FAILED" -gt 50 ]; then
-    echo -e "\${RED}[CRITICAL] \${FAILED} failed SSH attempts in 24h!\${NC}"
-    ALERTS=\$((ALERTS + 1))
+    echo -e "\${RED}[CRITICAL] \${FAILED} failed SSH\${NC}"; ALERTS=\$((ALERTS+1))
 elif [ "\$FAILED" -gt 10 ]; then
-    echo -e "\${YELLOW}[WARNING] \${FAILED} failed SSH attempts in 24h.\${NC}"
-    ALERTS=\$((ALERTS + 1))
+    echo -e "\${YELLOW}[WARNING] \${FAILED} failed SSH\${NC}"; ALERTS=\$((ALERTS+1))
 else
-    echo -e "\${GREEN}[OK] Failed SSH attempts (24h): \${FAILED}\${NC}"
+    echo -e "\${GREEN}[OK] Failed SSH (24h): \${FAILED}\${NC}"
 fi
 
 BANS=\$(fail2ban-client status sshd 2>/dev/null \
     | grep "Total banned" | awk '{print \$NF}')
 BANS=\${BANS:-0}
 if [ "\$BANS" -gt 0 ]; then
-    echo -e "\${YELLOW}[INFO] fail2ban has banned \${BANS} IP(s) total.\${NC}"
-    fail2ban-client status sshd 2>/dev/null \
-        | grep "Banned IP" | cut -d: -f2
+    echo -e "\${YELLOW}[INFO] fail2ban banned \${BANS} IP(s)\${NC}"
 else
-    echo -e "\${GREEN}[OK] No IPs currently banned.\${NC}"
+    echo -e "\${GREEN}[OK] No IPs banned\${NC}"
 fi
 
 find / -perm -4000 -type f 2>/dev/null | grep -v snap | sort \
@@ -1138,71 +1123,53 @@ SUID_DIFF=\$(diff $BASELINE_DIR/suid-baseline.txt \
     /tmp/current-suid-check.txt 2>/dev/null || true)
 rm /tmp/current-suid-check.txt
 if [ -n "\$SUID_DIFF" ]; then
-    echo -e "\${RED}[CRITICAL] SUID files have changed!\${NC}"
-    echo "\$SUID_DIFF"
-    ALERTS=\$((ALERTS + 1))
+    echo -e "\${RED}[CRITICAL] SUID changed!\${NC}"; ALERTS=\$((ALERTS+1))
 else
-    echo -e "\${GREEN}[OK] SUID files unchanged.\${NC}"
+    echo -e "\${GREEN}[OK] SUID unchanged\${NC}"
 fi
 
 for SVC in ssh fail2ban; do
     if systemctl is-active --quiet "\$SVC"; then
-        echo -e "\${GREEN}[OK] \$SVC is running.\${NC}"
+        echo -e "\${GREEN}[OK] \$SVC running\${NC}"
     else
-        echo -e "\${RED}[CRITICAL] \$SVC is not running!\${NC}"
-        ALERTS=\$((ALERTS + 1))
+        echo -e "\${RED}[CRITICAL] \$SVC down!\${NC}"; ALERTS=\$((ALERTS+1))
     fi
 done
 
 if ufw status | grep -q "Status: active"; then
-    echo -e "\${GREEN}[OK] UFW firewall is active.\${NC}"
+    echo -e "\${GREEN}[OK] UFW active\${NC}"
 else
-    echo -e "\${RED}[CRITICAL] UFW firewall is not active!\${NC}"
-    ALERTS=\$((ALERTS + 1))
+    echo -e "\${RED}[CRITICAL] UFW inactive!\${NC}"; ALERTS=\$((ALERTS+1))
 fi
 
 echo ""
-echo "--- Currently Listening Ports ---"
 ss -tlnp | grep LISTEN
-
 echo ""
-echo "=========================================="
 if [ "\$ALERTS" -eq 0 ]; then
-    echo -e "\${GREEN}All checks passed. No alerts.\${NC}"
+    echo -e "\${GREEN}All checks passed.\${NC}"
 else
-    echo -e "\${RED}\${ALERTS} alert(s) found. Review above.\${NC}"
+    echo -e "\${RED}\${ALERTS} alert(s) found.\${NC}"
 fi
-echo "=========================================="
 echo ""
 ALERT_EOF
 
-chmod 750 "$SCRIPTS_DIR/daily-audit.sh"
-chmod 750 "$SCRIPTS_DIR/check-alerts.sh"
+chmod 750 "$SCRIPTS_DIR/daily-audit.sh" "$SCRIPTS_DIR/check-alerts.sh"
 
 if id "$INPUT_USERNAME" &>/dev/null; then
     chown root:"$INPUT_USERNAME" "$SCRIPTS_DIR/daily-audit.sh"
     chown root:"$INPUT_USERNAME" "$SCRIPTS_DIR/check-alerts.sh"
-else
-    chown root:root "$SCRIPTS_DIR/daily-audit.sh"
-    chown root:root "$SCRIPTS_DIR/check-alerts.sh"
 fi
 
 ln -sf "$SCRIPTS_DIR/check-alerts.sh" /usr/local/bin/check-alerts
-log_ok "Created 'check-alerts' system command."
 
-log_info "Scheduling daily audit at 4:00 AM..."
 (crontab -l 2>/dev/null | grep -v "daily-audit.sh"; \
  echo "0 4 * * * $SCRIPTS_DIR/daily-audit.sh") | crontab -
 log_ok "Cron job scheduled."
 
-log_info "Testing audit script..."
+log_info "Testing scripts..."
 bash "$SCRIPTS_DIR/daily-audit.sh"
-tail -30 "$AUDIT_LOG"
-log_ok "Audit script working."
-
-log_info "Testing check-alerts..."
 bash "$SCRIPTS_DIR/check-alerts.sh" || true
-log_ok "Alert checker working."
+log_ok "Monitoring configured."
 
 # =============================================================================
 # FINAL SUMMARY
@@ -1210,23 +1177,17 @@ log_ok "Alert checker working."
 
 log_section "Hardening Complete"
 
-echo -e "${BOLD}${GREEN}All phases completed successfully.${NC}\n"
+echo -e "${BOLD}${GREEN}All phases completed.${NC}\n"
 
-echo -e "${BOLD}Environment:${NC}"
-echo -e "  Provider: ${GREEN}$CLOUD_PROVIDER${NC}"
-echo -e "  OS:       ${GREEN}$OS_ID $OS_VERSION${NC}"
-echo ""
-
-echo -e "${BOLD}Configuration Applied:${NC}"
+echo -e "${BOLD}Configuration:${NC}"
 echo -e "  Hostname:     ${GREEN}$INPUT_HOSTNAME${NC}"
 echo -e "  SSH Port:     ${GREEN}$INPUT_SSH_PORT${NC}"
 echo -e "  Admin User:   ${GREEN}$INPUT_USERNAME${NC}"
 echo -e "  Auth Method:  ${GREEN}$AUTH_TYPE${NC}"
-echo -e "  Cloud User:   ${GREEN}$INPUT_CLOUD_USER (demoted and locked)${NC}"
 echo -e "  Public IP:    ${GREEN}$PUBLIC_IP${NC}"
 echo ""
 
-echo -e "${BOLD}SSH Connection Command:${NC}"
+echo -e "${BOLD}SSH Connection:${NC}"
 if [[ "$AUTH_TYPE" == "key" ]]; then
     echo -e "  ${CYAN}ssh -i ~/.ssh/id_ed25519 -p $INPUT_SSH_PORT $INPUT_USERNAME@$PUBLIC_IP${NC}"
 else
@@ -1235,44 +1196,23 @@ fi
 echo ""
 
 if [[ "$AUTH_TYPE" == "password" ]]; then
-    echo -e "${BOLD}${YELLOW}Security Recommendation:${NC}"
-    echo -e "${YELLOW}  Password authentication is still enabled.${NC}"
-    echo -e "${YELLOW}  For stronger security, set up SSH keys later:${NC}"
-    echo ""
-    echo -e "  ${CYAN}# On your local machine:${NC}"
-    echo -e "  ${CYAN}ssh-keygen -t ed25519 -C \"my-vps-key\"${NC}"
+    echo -e "${BOLD}${YELLOW}Switch to SSH keys later:${NC}"
+    echo -e "  ${CYAN}ssh-keygen -t ed25519${NC}"
     echo -e "  ${CYAN}ssh-copy-id -p $INPUT_SSH_PORT $INPUT_USERNAME@$PUBLIC_IP${NC}"
-    echo ""
-    echo -e "  ${CYAN}# Then on the server:${NC}"
-    echo -e "  ${CYAN}sudo sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/' \\${NC}"
-    echo -e "  ${CYAN}    /etc/ssh/sshd_config.d/99-hardened.conf${NC}"
+    echo -e "  ${CYAN}sudo sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config.d/99-hardened.conf${NC}"
     echo -e "  ${CYAN}sudo sshd -t && sudo systemctl restart ssh${NC}"
     echo ""
 fi
 
-echo -e "${BOLD}Key Files Created:${NC}"
-echo -e "  SSH Config:    /etc/ssh/sshd_config.d/99-hardened.conf"
-echo -e "  fail2ban:      /etc/fail2ban/jail.local"
-echo -e "  Audit Log:     $AUDIT_LOG"
-echo -e "  Audit Script:  $SCRIPTS_DIR/daily-audit.sh"
-echo -e "  Alert Script:  $SCRIPTS_DIR/check-alerts.sh"
-echo -e "  SUID Baseline: $BASELINE_DIR/suid-baseline.txt"
-echo -e "  Script Log:    $LOGFILE"
-echo ""
-
 echo -e "${BOLD}Daily Commands:${NC}"
-echo -e "  ${CYAN}sudo check-alerts${NC}                    Run security check"
-echo -e "  ${CYAN}sudo fail2ban-client status sshd${NC}     Check banned IPs"
-echo -e "  ${CYAN}sudo ufw status verbose${NC}              Check firewall rules"
-echo -e "  ${CYAN}sudo journalctl -u ssh -n 50${NC}         Recent SSH activity"
-echo -e "  ${CYAN}sudo tail -f $AUDIT_LOG${NC}   Follow audit log"
-echo ""
+echo -e "  ${CYAN}sudo check-alerts${NC}"
+echo -e "  ${CYAN}sudo fail2ban-client status sshd${NC}"
+echo -e "  ${CYAN}sudo ufw status verbose${NC}"
+echo -e "  ${CYAN}sudo journalctl -u ssh -n 50${NC}"
 
 if [[ "$CLOUD_PROVIDER" =~ ^(oracle|aws|azure|gcp)$ ]]; then
-    log_warn "══════════════════════════════════════════════════════"
-    log_warn "REMINDER: Confirm port $INPUT_SSH_PORT is open in your"
-    log_warn "cloud provider's network security console."
-    log_warn "══════════════════════════════════════════════════════"
+    echo ""
+    log_warn "Confirm port $INPUT_SSH_PORT is open in your cloud console."
 fi
 
-echo -e "\n${BOLD}Full script log: $LOGFILE${NC}\n"
+echo -e "\n${BOLD}Log: $LOGFILE${NC}\n"
