@@ -131,7 +131,7 @@ dry_run_cmd() {
 # PROGRESS BAR
 # =============================================================================
 
-TOTAL_PHASES=13
+TOTAL_PHASES=14
 CURRENT_PHASE_NUM=0
 
 draw_progress() {
