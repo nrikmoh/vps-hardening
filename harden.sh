@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# VPS Hardening Script v4.0
+# VPS Hardening Script v5.0
 # Supports: Ubuntu 20.04, 22.04, 24.04
 # Providers: Oracle, AWS, DigitalOcean, Hetzner, Linode, Vultr, GCP, Azure
 # Usage: sudo ./harden.sh [--resume] [--skip PHASE] [--only PHASE] [--no-color]
@@ -12,7 +12,7 @@ set -euo pipefail
 # VERSION & PATHS
 # =============================================================================
 
-VPS_VERSION="4.0.0"
+VPS_VERSION="5.0.0"
 VPS_STATE_DIR="/var/lib/vps-hardening"
 VPS_LOG_DIR="/var/log/vps-hardening"
 VPS_STATE_FILE="${VPS_STATE_DIR}/state"
@@ -25,6 +25,9 @@ VPS_INSTALL_LOG="${VPS_LOG_DIR}/install.log"
 RESUME_MODE=false
 SKIP_PHASES=()
 ONLY_PHASE=""
+NO_COLOR=${NO_COLOR:-0}
+DRY_RUN=false
+VERBOSE=false
 
 usage() {
     cat << EOF
@@ -35,10 +38,12 @@ Options:
   --skip PHASE_ID   Skip a phase (e.g. --skip 07)
   --only PHASE_ID   Run only one phase
   --no-color        Disable colors
+  --dry-run         Show what would be done without making changes
+  --verbose         Extra output
   --version         Print version
   --help            This help text
 
-Phase IDs: 01 02 03 04 05 06 07 08 09 10 11 12 13
+Phase IDs: 01 02 03 04 05 06 07 08 09 10 11 12 13 14
 EOF
 }
 
@@ -48,6 +53,8 @@ while [[ $# -gt 0 ]]; do
         --skip)      SKIP_PHASES+=("$2"); shift ;;
         --only)      ONLY_PHASE="$2"; shift ;;
         --no-color)  NO_COLOR=1 ;;
+        --dry-run)   DRY_RUN=true ;;
+        --verbose)   VERBOSE=true ;;
         --version)   echo "vps-hardening ${VPS_VERSION}"; exit 0 ;;
         --help|-h)   usage; exit 0 ;;
         *)           echo "Unknown option: $1"; usage; exit 1 ;;
@@ -59,7 +66,7 @@ done
 # COLORS
 # =============================================================================
 
-if [[ -t 1 ]] && [[ "${NO_COLOR:-}" != "1" ]] && [[ "${TERM:-}" != "dumb" ]]; then
+if [[ -t 1 ]] && [[ "${NO_COLOR}" != "1" ]] && [[ "${TERM:-}" != "dumb" ]]; then
     _COLOR=1
 else
     _COLOR=0
@@ -79,7 +86,7 @@ DIM="$(_c '2')"
 ITALIC="$(_c '3')"
 NC="$(_c '0')"
 
-SPINNER='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+SPINNER_CHARS='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 
 # =============================================================================
 # LOGGING
@@ -98,6 +105,7 @@ log_error() { echo -e "  ${RED}✗${NC}  $1" >&2; _log_raw "ERROR" "$1"; }
 log_info()  { echo -e "  ${BLUE}ℹ${NC}  $1"; _log_raw "INFO"  "$1"; }
 log_step()  { echo -e "  ${CYAN}→${NC}  $1"; _log_raw "STEP"  "$1"; }
 log_tip()   { echo -e "  ${MAGENTA}💡${NC} $1"; _log_raw "TIP"   "$1"; }
+log_verbose() { [[ "$VERBOSE" == "true" ]] && echo -e "  ${DIM}   $1${NC}" || true; }
 
 die() {
     local MSG="${1:-Fatal error}" CODE="${2:-1}"
@@ -108,18 +116,50 @@ die() {
 }
 
 # =============================================================================
+# DRY RUN WRAPPER
+# =============================================================================
+
+dry_run_cmd() {
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo -e "  ${DIM}[DRY-RUN]${NC} $*"
+        return 0
+    fi
+    "$@"
+}
+
+# =============================================================================
+# PROGRESS BAR
+# =============================================================================
+
+TOTAL_PHASES=13
+CURRENT_PHASE_NUM=0
+
+draw_progress() {
+    local CURRENT="$1" TOTAL="$2" LABEL="${3:-}"
+    local PCT=$(( CURRENT * 100 / TOTAL ))
+    local FILLED=$(( CURRENT * 40 / TOTAL ))
+    local EMPTY=$(( 40 - FILLED ))
+    local BAR=""
+
+    for (( i=0; i<FILLED; i++ )); do BAR+="█"; done
+    for (( i=0; i<EMPTY;  i++ )); do BAR+="░"; done
+
+    echo -e "\n  ${CYAN}Progress${NC}  [${GREEN}${BAR}${NC}] ${BOLD}${PCT}%%${NC}  ${DIM}Phase ${CURRENT}/${TOTAL}${NC}  ${LABEL}\n"
+}
+
+# =============================================================================
 # SPINNER / RUN_SILENT
 # =============================================================================
 
 spin() {
     local MSG="$1" PID="$2" EXIT_FILE="$3"
-    local i=0 LEN=${#SPINNER}
+    local i=0 LEN=${#SPINNER_CHARS}
 
     if [[ "$_COLOR" -eq 1 ]]; then
-        echo -ne "  ${CYAN}${SPINNER:0:1}${NC}  $MSG"
+        echo -ne "  ${CYAN}${SPINNER_CHARS:0:1}${NC}  $MSG"
         while kill -0 "$PID" 2>/dev/null; do
             i=$(( (i+1) % LEN ))
-            echo -ne "\r  ${CYAN}${SPINNER:$i:1}${NC}  $MSG"
+            echo -ne "\r  ${CYAN}${SPINNER_CHARS:$i:1}${NC}  $MSG"
             sleep 0.1
         done
         echo -ne "\r"
@@ -143,6 +183,12 @@ spin() {
 
 run_silent() {
     local MSG="$1"; shift
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo -e "  ${DIM}[DRY-RUN]${NC}  $MSG"
+        return 0
+    fi
+
     local EXIT_FILE STDERR_FILE
     EXIT_FILE=$(mktemp)
     STDERR_FILE=$(mktemp)
@@ -157,12 +203,35 @@ run_silent() {
 
     if [[ "$CODE" -ne 0 ]]; then
         echo "--- stderr for: $* ---" >> "${VPS_INSTALL_LOG}"
-        cat "$STDERR_FILE"           >> "${VPS_INSTALL_LOG}"
-        echo "--- end stderr ---"    >> "${VPS_INSTALL_LOG}"
+        cat "$STDERR_FILE"            >> "${VPS_INSTALL_LOG}"
+        echo "--- end stderr ---"     >> "${VPS_INSTALL_LOG}"
     fi
 
     rm -f "$EXIT_FILE" "$STDERR_FILE"
     return "$CODE"
+}
+
+# =============================================================================
+# TIMING TRACKER
+# =============================================================================
+
+declare -A PHASE_TIMES
+
+phase_timer_start() {
+    PHASE_TIMES["${1}_start"]=$(date +%s%N)
+}
+
+phase_timer_end() {
+    local ID="$1"
+    local END NOW START
+    END=$(date +%s%N)
+    START="${PHASE_TIMES["${ID}_start"]:-$END}"
+    local MS=$(( (END - START) / 1000000 ))
+    if [[ $MS -lt 1000 ]]; then
+        PHASE_TIMES["${ID}_duration"]="${MS}ms"
+    else
+        PHASE_TIMES["${ID}_duration"]="$(( MS / 1000 ))s"
+    fi
 }
 
 # =============================================================================
@@ -258,6 +327,17 @@ get_public_ip() {
     done
     log_warn "Could not detect public IP." >&2
     echo "YOUR_SERVER_IP"
+}
+
+get_geo_info() {
+    local IP="${1:-}"
+    local GEO
+    GEO=$(curl -s --max-time 5 "https://ipapi.co/${IP}/json/" 2>/dev/null || echo "{}")
+    local COUNTRY CITY ORG
+    COUNTRY=$(echo "$GEO" | grep -oP '"country_name":\s*"\K[^"]+' || echo "Unknown")
+    CITY=$(echo "$GEO"    | grep -oP '"city":\s*"\K[^"]+' || echo "Unknown")
+    ORG=$(echo "$GEO"     | grep -oP '"org":\s*"\K[^"]+' || echo "Unknown")
+    echo "${CITY}, ${COUNTRY} (${ORG})"
 }
 
 # =============================================================================
@@ -369,28 +449,46 @@ fi
 print_banner() {
     clear
     echo ""
-    echo -e "${BOLD}${CYAN}"
-    echo "  ╔══════════════════════════════════════════════════════════╗"
-    echo "  ║                                                          ║"
-    echo "  ║     🛡️   VPS HARDENING SCRIPT  v${VPS_VERSION}               ║"
-    echo "  ║     Production-grade server security in one script       ║"
-    echo "  ║                                                          ║"
-    echo "  ╚══════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
+    if [[ "$_COLOR" -eq 1 ]]; then
+        echo -e "\033[0;36m"
+        echo "  ╔══════════════════════════════════════════════════════════╗"
+        echo "  ║                                                          ║"
+        echo "  ║   \033[1;37m🛡️   VPS HARDENING SCRIPT  v${VPS_VERSION}\033[0;36m               ║"
+        echo "  ║   \033[2m    Production-grade server security in one script\033[0;36m    ║"
+        echo "  ║                                                          ║"
+        echo "  ╚══════════════════════════════════════════════════════════╝"
+        echo -e "\033[0m"
+    else
+        echo "  ╔══════════════════════════════════════════════════════════╗"
+        echo "  ║   VPS HARDENING SCRIPT  v${VPS_VERSION}                      ║"
+        echo "  ╚══════════════════════════════════════════════════════════╝"
+    fi
     echo -e "  ${DIM}Ubuntu 20.04 / 22.04 / 24.04${NC}"
     echo -e "  ${DIM}Oracle · AWS · DigitalOcean · Hetzner · Linode · Vultr · GCP · Azure${NC}"
+    [[ "$DRY_RUN"  == "true" ]] && echo -e "  ${YELLOW}⚠  DRY-RUN MODE — no changes will be made${NC}"
+    [[ "$VERBOSE"  == "true" ]] && echo -e "  ${BLUE}ℹ  VERBOSE MODE active${NC}"
     echo ""
 }
 
 print_phase() {
     local NUM="$1" TITLE="$2" DESC="${3:-}"
-    echo ""
+    CURRENT_PHASE_NUM=$((CURRENT_PHASE_NUM + 1))
+    draw_progress "$CURRENT_PHASE_NUM" "$TOTAL_PHASES" "$TITLE"
     echo -e "  ${BOLD}${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo -e "  ${BOLD}${WHITE}  Phase $NUM${NC}  ${BOLD}$TITLE${NC}"
     [[ -n "$DESC" ]] && echo -e "  ${DIM}  $DESC${NC}"
     echo -e "  ${BOLD}${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
     _log_raw "PHASE" "=== Phase $NUM: $TITLE ==="
+    phase_timer_start "$NUM"
+}
+
+print_phase_done() {
+    local NUM="$1"
+    phase_timer_end "$NUM"
+    local DUR="${PHASE_TIMES["${NUM}_duration"]:-?}"
+    echo -e "  ${DIM}  Phase $NUM complete — ${DUR}${NC}"
+    echo ""
 }
 
 print_divider() {
@@ -414,6 +512,21 @@ pause() {
     read -r
 }
 
+# Typewriter effect for important messages
+typewrite() {
+    local MSG="$1" DELAY="${2:-0.02}"
+    if [[ "$_COLOR" -eq 1 ]]; then
+        echo -n "  "
+        while IFS= read -r -n1 char; do
+            echo -n "$char"
+            sleep "$DELAY"
+        done <<< "$MSG"
+        echo ""
+    else
+        echo "  $MSG"
+    fi
+}
+
 # =============================================================================
 # PHASE RUNNER
 # =============================================================================
@@ -434,6 +547,7 @@ run_phase() {
 
     if [[ "$RESUME_MODE" == "true" ]] && phase_complete "$PHASE_ID"; then
         log_info "Phase $PHASE_ID already done — skipping (--resume)"
+        CURRENT_PHASE_NUM=$((CURRENT_PHASE_NUM + 1))
         return 0
     fi
 
@@ -477,9 +591,11 @@ echo -e "  ${CYAN} 10.${NC}  Kernel hardening (sysctl)"
 echo -e "  ${CYAN} 11.${NC}  auditd — kernel-level activity logging"
 echo -e "  ${CYAN} 12.${NC}  Create admin account + final SSH lockdown"
 echo -e "  ${CYAN} 13.${NC}  Security monitoring (daily audit + check-alerts)"
+echo -e "  ${CYAN} 14.${NC}  ${BOLD}${GREEN}NEW${NC} — Login banner + MOTD + SSH fingerprint"
 echo ""
 echo -e "  ${DIM}Estimated time: 10–15 minutes${NC}"
 [[ "$RESUME_MODE" == "true" ]] && log_info "Resume mode active"
+[[ "$DRY_RUN"    == "true" ]] && log_info "Dry-run mode — no changes"
 echo ""
 
 pause
@@ -488,7 +604,12 @@ pause
 # PHASE 0a — ENVIRONMENT DETECTION
 # =============================================================================
 
-print_phase "0a" "Environment Detection" "Analyzing your server"
+echo ""
+echo -e "  ${BOLD}${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "  ${BOLD}${WHITE}  Phase 0a${NC}  ${BOLD}Environment Detection${NC}"
+echo -e "  ${DIM}  Analyzing your server${NC}"
+echo -e "  ${BOLD}${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
 
 echo -ne "  ${CYAN}⠋${NC}  Reading OS information"
 OS_ID=$(grep      "^ID="               /etc/os-release | cut -d= -f2 | tr -d '"')
@@ -580,16 +701,35 @@ CPU_CORES=$(nproc 2>/dev/null || echo 1)
 RAM_MB=$(free -m | grep Mem | awk '{print $2}')
 echo -e "\r  ${GREEN}✓${NC}  Services scanned | Hardware: ${CPU_CORES} CPU / ${RAM_MB}MB RAM"
 
+# Check for existing security tools
+echo -ne "  ${CYAN}⠋${NC}  Scanning existing security tools"
+HAS_UFW=false; HAS_FAIL2BAN=false; HAS_APPARMOR=false
+HAS_AUDITD=false; HAS_AIDE=false; HAS_RKHUNTER=false
+command -v ufw         > /dev/null 2>&1 && HAS_UFW=true
+command -v fail2ban-client > /dev/null 2>&1 && HAS_FAIL2BAN=true
+command -v aa-status   > /dev/null 2>&1 && HAS_APPARMOR=true
+command -v auditctl    > /dev/null 2>&1 && HAS_AUDITD=true
+command -v aide        > /dev/null 2>&1 && HAS_AIDE=true
+command -v rkhunter    > /dev/null 2>&1 && HAS_RKHUNTER=true
+echo -e "\r  ${GREEN}✓${NC}  Security tool inventory complete"
+
 print_divider
 echo -e "  ${BOLD}Detection Summary:${NC}"
 echo ""
 echo -e "    ${DIM}OS${NC}          $OS_ID $OS_VERSION ($OS_CODENAME)"
 echo -e "    ${DIM}Cloud${NC}       $CLOUD_PROVIDER"
 echo -e "    ${DIM}User${NC}        $CURRENT_USER"
+echo -e "    ${DIM}CPU/RAM${NC}     ${CPU_CORES} cores / ${RAM_MB}MB"
 echo -e "    ${DIM}cloud-init${NC}  $( [[ "$HAS_CLOUD_INIT" == "true" ]] \
     && echo "${GREEN}present${NC}" || echo "absent")"
 echo -e "    ${DIM}iptables${NC}    $( [[ "$CONFLICTING_IPTABLES" == "true" ]] \
     && echo "${YELLOW}conflicts${NC}" || echo "${GREEN}clean${NC}")"
+echo -e "    ${DIM}Preinstalled${NC} $( \
+    [[ "$HAS_UFW" == "true" ]]      && echo -n "ufw " ; \
+    [[ "$HAS_FAIL2BAN" == "true" ]] && echo -n "fail2ban " ; \
+    [[ "$HAS_APPARMOR" == "true" ]] && echo -n "apparmor " ; \
+    [[ "$HAS_AUDITD" == "true" ]]   && echo -n "auditd " ; \
+    echo "")"
 echo ""
 log_ok "Detection complete"
 
@@ -597,7 +737,12 @@ log_ok "Detection complete"
 # PHASE 0b — CONFIGURATION
 # =============================================================================
 
-print_phase "0b" "Configuration" "Your choices — no changes made yet"
+echo ""
+echo -e "  ${BOLD}${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "  ${BOLD}${WHITE}  Phase 0b${NC}  ${BOLD}Configuration${NC}"
+echo -e "  ${DIM}  Your choices — no changes made yet${NC}"
+echo -e "  ${BOLD}${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
 
 # ---------------------------------------------------------------------------
 # Auth method
@@ -706,6 +851,24 @@ while [[ -z "$INPUT_HOSTNAME" \
 done
 
 # ---------------------------------------------------------------------------
+# Timezone
+# ---------------------------------------------------------------------------
+print_divider
+echo -e "  ${BOLD}🕐 Timezone${NC}"
+CURRENT_TZ=$(timedatectl show --property=Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo "UTC")
+echo -e "  ${DIM}Current: ${CURRENT_TZ}${NC}"
+echo -e "  ${DIM}Examples: UTC  America/New_York  Europe/London  Asia/Tokyo${NC}"
+echo ""
+read -rp "  Timezone [${CURRENT_TZ}]: " INPUT_TZ
+INPUT_TZ="${INPUT_TZ:-$CURRENT_TZ}"
+while ! timedatectl list-timezones 2>/dev/null | grep -qx "$INPUT_TZ"; do
+    log_warn "'$INPUT_TZ' is not a valid timezone. Check 'timedatectl list-timezones'."
+    read -rp "  Timezone [${CURRENT_TZ}]: " INPUT_TZ
+    INPUT_TZ="${INPUT_TZ:-$CURRENT_TZ}"
+done
+log_ok "Timezone: $INPUT_TZ"
+
+# ---------------------------------------------------------------------------
 # SSH Port
 # ---------------------------------------------------------------------------
 print_divider
@@ -767,6 +930,26 @@ if [[ "$CURRENT_USER" != "root" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Login banner text
+# ---------------------------------------------------------------------------
+print_divider
+echo -e "  ${BOLD}🚨 Legal Warning Banner${NC}"
+echo -e "  ${DIM}Shown before login — deters attackers, required for legal protection.${NC}"
+echo ""
+echo -e "    ${CYAN}1)${NC}  Default (recommended)"
+echo -e "    ${CYAN}2)${NC}  Custom"
+echo ""
+read -rp "  Banner (1/2): " BANNER_CHOICE
+BANNER_TEXT=""
+if [[ "$BANNER_CHOICE" == "2" ]]; then
+    echo -e "  Enter your banner text (one line):"
+    read -rp "  > " BANNER_TEXT
+fi
+if [[ -z "$BANNER_TEXT" ]]; then
+    BANNER_TEXT="UNAUTHORIZED ACCESS PROHIBITED. All connections are monitored and logged. Disconnect immediately if you are not an authorized user."
+fi
+
+# ---------------------------------------------------------------------------
 # Optional features
 # ---------------------------------------------------------------------------
 print_divider
@@ -782,7 +965,7 @@ echo -e "    ${CYAN}e)${NC}  AIDE file integrity (full system)    ${DIM}optional
 echo ""
 echo -e "  ${DIM}Enter letters to enable (e.g. ab or abcd or all):${NC}"
 read -rp "  Features: " FEATURE_INPUT
-FEATURE_INPUT="${FEATURE_INPUT,,}"  # lowercase
+FEATURE_INPUT="${FEATURE_INPUT,,}"
 
 ENABLE_SYSCTL=false
 ENABLE_AUDITD=false
@@ -805,6 +988,7 @@ echo -e "  ${BOLD}${CYAN}║${NC}  ${BOLD}${WHITE}CONFIGURATION SUMMARY${NC}"
 echo -e "  ${BOLD}${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "    ${DIM}Hostname${NC}         ${BOLD}${GREEN}$INPUT_HOSTNAME${NC}"
+echo -e "    ${DIM}Timezone${NC}         ${BOLD}${GREEN}$INPUT_TZ${NC}"
 echo -e "    ${DIM}SSH Port${NC}         ${BOLD}${GREEN}$INPUT_SSH_PORT${NC}"
 echo -e "    ${DIM}Admin User${NC}       ${BOLD}${GREEN}$INPUT_USERNAME${NC}"
 echo -e "    ${DIM}Auth Method${NC}      ${BOLD}${GREEN}$AUTH_TYPE${NC}"
@@ -827,7 +1011,7 @@ read -rp "  Proceed? (yes/no): " CONFIRM
 {
     echo "════════════════════════════════════════"
     echo "Started : $(date)"
-    echo "Config  : Host=$INPUT_HOSTNAME Port=$INPUT_SSH_PORT User=$INPUT_USERNAME"
+    echo "Config  : Host=$INPUT_HOSTNAME TZ=$INPUT_TZ Port=$INPUT_SSH_PORT User=$INPUT_USERNAME"
     echo "Auth    : $AUTH_TYPE | Provider: $CLOUD_PROVIDER | OS: $OS_ID $OS_VERSION"
     echo "Options : sysctl=$ENABLE_SYSCTL auditd=$ENABLE_AUDITD rkhunter=$ENABLE_RKHUNTER clamav=$ENABLE_CLAMAV aide=$ENABLE_AIDE"
     echo "════════════════════════════════════════"
@@ -837,14 +1021,20 @@ read -rp "  Proceed? (yes/no): " CONFIRM
 # ASSESSMENT
 # =============================================================================
 
-print_phase "Assessment" "Initial State" "Snapshot before changes"
+echo ""
+echo -e "  ${BOLD}${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "  ${BOLD}${WHITE}  Assessment${NC}  ${BOLD}Initial State${NC}"
+echo -e "  ${DIM}  Snapshot before changes${NC}"
+echo -e "  ${BOLD}${MAGENTA}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
 
 PUBLIC_IP=$(get_public_ip)
+GEO_INFO=$(get_geo_info "$PUBLIC_IP")
 
 echo -e "  ${BOLD}System Overview:${NC}"
 echo ""
 echo -e "    ${DIM}Hostname${NC}     $(hostname)"
-echo -e "    ${DIM}Public IP${NC}    ${BOLD}$PUBLIC_IP${NC}"
+echo -e "    ${DIM}Public IP${NC}    ${BOLD}$PUBLIC_IP${NC}  ${DIM}($GEO_INFO)${NC}"
 echo -e "    ${DIM}Kernel${NC}       $(uname -r)"
 echo -e "    ${DIM}OS${NC}           $(grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '"')"
 echo -e "    ${DIM}Uptime${NC}       $(uptime -p 2>/dev/null || echo 'unknown')"
@@ -869,9 +1059,9 @@ pause
 
 phase_01() {
     print_phase "01" "System Update" \
-        "Full update + kernel reboot detection"
+        "Full update + kernel reboot detection + timezone"
 
-    phase_complete "01" && { log_ok "Phase 01 done — skipping"; return 0; }
+    phase_complete "01" && { log_ok "Phase 01 done — skipping"; print_phase_done "01"; return 0; }
 
     local KERNEL_BEFORE
     KERNEL_BEFORE=$(uname -r)
@@ -889,6 +1079,15 @@ phase_01() {
     run_silent "Setting hostname to $INPUT_HOSTNAME" \
         hostnamectl set-hostname "$INPUT_HOSTNAME"
 
+    run_silent "Setting timezone to $INPUT_TZ" \
+        timedatectl set-timezone "$INPUT_TZ"
+
+    # Enable NTP time sync
+    if command -v timedatectl > /dev/null 2>&1; then
+        timedatectl set-ntp true > /dev/null 2>&1 || true
+        log_ok "NTP time synchronisation enabled"
+    fi
+
     if [[ "$HAS_CLOUD_INIT" == "true" ]]; then
         echo "preserve_hostname: true" \
             > /etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg 2>/dev/null || true
@@ -902,7 +1101,10 @@ phase_01() {
     fi
 
     log_ok "Hostname: ${BOLD}$INPUT_HOSTNAME${NC}"
+    log_ok "Timezone: ${BOLD}$INPUT_TZ${NC}"
+
     phase_done "01"
+    print_phase_done "01"
 }
 
 # =============================================================================
@@ -913,7 +1115,7 @@ phase_02() {
     print_phase "02" "Remove Unnecessary Services" \
         "Less attack surface"
 
-    phase_complete "02" && { log_ok "Phase 02 done — skipping"; return 0; }
+    phase_complete "02" && { log_ok "Phase 02 done — skipping"; print_phase_done "02"; return 0; }
 
     local REMOVED=0
 
@@ -941,6 +1143,16 @@ phase_02() {
         REMOVED=$((REMOVED+1))
     fi
 
+    # Disable Avahi/mDNS (not needed on server)
+    if systemctl list-unit-files avahi-daemon.service &>/dev/null \
+       | grep -q "avahi-daemon"; then
+        run_silent "Masking avahi-daemon (mDNS not needed on server)" bash -c '
+            systemctl stop    avahi-daemon 2>/dev/null || true
+            systemctl disable avahi-daemon 2>/dev/null || true
+            systemctl mask    avahi-daemon 2>/dev/null || true'
+        REMOVED=$((REMOVED+1))
+    fi
+
     systemctl daemon-reload 2>/dev/null || true
     echo ""
     [[ "$REMOVED" -eq 0 ]] \
@@ -948,6 +1160,7 @@ phase_02() {
         || log_ok "$REMOVED service(s) disabled and masked"
 
     phase_done "02"
+    print_phase_done "02"
 }
 
 # =============================================================================
@@ -955,27 +1168,32 @@ phase_02() {
 # =============================================================================
 
 phase_03() {
-    print_phase "03" "Firewall" "UFW + iptables cleanup"
+    print_phase "03" "Firewall" "UFW + iptables cleanup + rate limiting"
 
-    phase_complete "03" && { log_ok "Phase 03 done — skipping"; return 0; }
+    phase_complete "03" && { log_ok "Phase 03 done — skipping"; print_phase_done "03"; return 0; }
 
     run_silent "Installing UFW" \
         bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ufw'
 
     ufw default deny incoming  > /dev/null 2>&1
+    ufw default deny forward   > /dev/null 2>&1
     ufw default allow outgoing > /dev/null 2>&1
-    log_ok "Default: deny incoming / allow outgoing"
+    log_ok "Default: deny incoming+forward / allow outgoing"
 
-    ufw allow 22/tcp               comment "SSH safety net" > /dev/null 2>&1
-    ufw allow "$INPUT_SSH_PORT"/tcp comment "SSH hardened"   > /dev/null 2>&1
-    log_ok "Ports open: 22 (safety net) + ${BOLD}$INPUT_SSH_PORT${NC}"
+    # Rate-limit SSH to stop floods even before fail2ban kicks in
+    ufw limit 22/tcp               comment "SSH safety net (rate-limited)" > /dev/null 2>&1
+    ufw limit "$INPUT_SSH_PORT"/tcp comment "SSH hardened (rate-limited)"   > /dev/null 2>&1
+    log_ok "Ports open: 22 safety net + ${BOLD}$INPUT_SSH_PORT${NC} (both rate-limited)"
+
+    # Logging
+    ufw logging on > /dev/null 2>&1 || true
+    log_ok "UFW logging enabled"
 
     echo "y" | ufw enable > /dev/null 2>&1
     log_ok "UFW ${BOLD}${GREEN}active${NC}"
 
     if [[ "$CONFLICTING_IPTABLES" == "true" ]]; then
         for SPEC in "${CONFLICTING_SPECS[@]}"; do
-            # shellcheck disable=SC2086
             iptables -D INPUT $SPEC 2>/dev/null || true
         done
         mkdir -p /etc/iptables
@@ -1004,6 +1222,7 @@ phase_03() {
     esac
 
     phase_done "03"
+    print_phase_done "03"
 }
 
 # =============================================================================
@@ -1014,7 +1233,7 @@ phase_04() {
     print_phase "04" "SSH Hardening" \
         "Port + crypto + settings (AllowUsers added after account confirmed)"
 
-    phase_complete "04" && { log_ok "Phase 04 done — skipping"; return 0; }
+    phase_complete "04" && { log_ok "Phase 04 done — skipping"; print_phase_done "04"; return 0; }
 
     echo -e "  ${DIM}Port 22 stays open until Phase 12 confirms your new account.${NC}"
     echo ""
@@ -1025,10 +1244,15 @@ phase_04() {
         cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
         mkdir -p /etc/ssh/sshd_config.d"
 
-    # Modern crypto — eliminates weak/legacy algorithms
+    # Regenerate weak moduli
+    run_silent "Hardening SSH moduli (removing weak DH params)" bash -c '
+        if [[ -f /etc/ssh/moduli ]]; then
+            awk "\$5 >= 3071" /etc/ssh/moduli > /tmp/moduli.safe
+            [[ -s /tmp/moduli.safe ]] && mv /tmp/moduli.safe /etc/ssh/moduli
+        fi' || true
+
     local CRYPTO_BLOCK
-    CRYPTO_BLOCK="
-KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
+    CRYPTO_BLOCK="KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
 HostKeyAlgorithms ssh-ed25519,rsa-sha2-512,rsa-sha2-256
 Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
 MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com"
@@ -1049,12 +1273,16 @@ MaxSessions 2
 LoginGraceTime 30
 ClientAliveInterval 300
 ClientAliveCountMax 3
+TCPKeepAlive no
 X11Forwarding no
 AllowAgentForwarding no
 AllowTcpForwarding no
 PermitUserEnvironment no
 PermitUserRC no
 DisableForwarding yes
+PrintMotd no
+PrintLastLog yes
+Banner /etc/issue.net
 LogLevel VERBOSE
 ${CRYPTO_BLOCK}
 EOF
@@ -1073,12 +1301,16 @@ MaxSessions 2
 LoginGraceTime 30
 ClientAliveInterval 300
 ClientAliveCountMax 3
+TCPKeepAlive no
 X11Forwarding no
 AllowAgentForwarding no
 AllowTcpForwarding no
 PermitUserEnvironment no
 PermitUserRC no
 DisableForwarding yes
+PrintMotd no
+PrintLastLog yes
+Banner /etc/issue.net
 LogLevel VERBOSE
 ${CRYPTO_BLOCK}
 EOF
@@ -1108,6 +1340,14 @@ EOF
 
     log_ok "SSH listening on port ${BOLD}$INPUT_SSH_PORT${NC}"
 
+    # Display SSH host key fingerprints for verification
+    echo ""
+    echo -e "  ${BOLD}SSH Host Fingerprints${NC} ${DIM}(save these for verification)${NC}"
+    ssh-keygen -l -f /etc/ssh/ssh_host_ed25519_key.pub 2>/dev/null \
+        && true || true
+    ssh-keygen -l -f /etc/ssh/ssh_host_rsa_key.pub 2>/dev/null \
+        && true || true
+
     print_box "TEST YOUR CONNECTION NOW" "$YELLOW"
     echo -e "  Open a NEW terminal:"
     if [[ "$AUTH_TYPE" == "key" ]]; then
@@ -1123,6 +1363,7 @@ EOF
 
     log_ok "Port $INPUT_SSH_PORT confirmed"
     phase_done "04"
+    print_phase_done "04"
 }
 
 # =============================================================================
@@ -1131,21 +1372,21 @@ EOF
 
 phase_05() {
     print_phase "05" "Brute Force Protection" \
-        "fail2ban — 3 failures = 24h ban"
+        "fail2ban — 3 failures = 24h ban + recidive jail"
 
-    phase_complete "05" && { log_ok "Phase 05 done — skipping"; return 0; }
+    phase_complete "05" && { log_ok "Phase 05 done — skipping"; print_phase_done "05"; return 0; }
 
-    # Write config BEFORE install so postinstall start succeeds
     log_step "Writing jail configuration"
     mkdir -p /etc/fail2ban
     cat > /etc/fail2ban/jail.local << EOF
 # jail.local — vps-hardening ${VPS_VERSION} — $(date)
 [DEFAULT]
-bantime  = 86400
-findtime = 1200
-maxretry = 3
-backend  = systemd
-ignoreip = 127.0.0.1/8 ::1
+bantime   = 86400
+findtime  = 1200
+maxretry  = 3
+backend   = systemd
+ignoreip  = 127.0.0.1/8 ::1
+banaction = ufw
 
 [sshd]
 enabled  = true
@@ -1153,9 +1394,18 @@ port     = ${INPUT_SSH_PORT}
 logpath  = %(sshd_log)s
 backend  = systemd
 maxretry = 3
+
+# Recidive: persistent offenders get 7-day ban
+[recidive]
+enabled  = true
+logpath  = /var/log/fail2ban.log
+banaction = ufw
+bantime  = 604800
+findtime = 86400
+maxretry = 3
 EOF
     chmod 640 /etc/fail2ban/jail.local
-    log_ok "jail.local written"
+    log_ok "jail.local written (SSH + recidive jail)"
 
     policy_block_start
     run_silent "Installing fail2ban" \
@@ -1173,12 +1423,13 @@ EOF
         fail2ban-client ping > /dev/null 2>&1 && \
             BANNED=$(fail2ban-client status sshd 2>/dev/null \
                 | grep "Currently banned" | awk '{print $NF}' || echo 0)
-        log_ok "fail2ban active — 3 strikes = 24h ban"
+        log_ok "fail2ban active — 3 strikes = 24h ban | repeat offenders = 7-day ban"
         [[ "${BANNED:-0}" -gt 0 ]] && \
             log_info "Already banned: ${BOLD}$BANNED${NC} IP(s)"
     fi
 
     phase_done "05"
+    print_phase_done "05"
 }
 
 # =============================================================================
@@ -1188,7 +1439,7 @@ EOF
 phase_06() {
     print_phase "06" "AppArmor" "Mandatory access control"
 
-    phase_complete "06" && { log_ok "Phase 06 done — skipping"; return 0; }
+    phase_complete "06" && { log_ok "Phase 06 done — skipping"; print_phase_done "06"; return 0; }
 
     if command -v aa-status > /dev/null 2>&1; then
         local BEFORE AFTER ENFORCED
@@ -1210,6 +1461,7 @@ phase_06() {
     fi
 
     phase_done "06"
+    print_phase_done "06"
 }
 
 # =============================================================================
@@ -1220,7 +1472,7 @@ phase_07() {
     print_phase "07" "Persistent Logging" \
         "journald + logrotate hardening + integrity checksums"
 
-    phase_complete "07" && { log_ok "Phase 07 done — skipping"; return 0; }
+    phase_complete "07" && { log_ok "Phase 07 done — skipping"; print_phase_done "07"; return 0; }
 
     # -- journald --
     run_silent "Configuring persistent journal" bash -c '
@@ -1283,6 +1535,20 @@ EOF
     log_ok "Log directories: sticky bit + restricted permissions"
 
     # -- Log integrity checksums --
+    # Define watched files in outer scope for count
+    local WATCHED_FILES=(
+        /etc/ssh/sshd_config
+        /etc/ssh/sshd_config.d/99-hardened.conf
+        /etc/fail2ban/jail.local
+        /etc/sudoers
+        /etc/passwd
+        /etc/shadow
+        /etc/group
+        /etc/hosts
+        /etc/crontab
+    )
+    local WATCHED_COUNT="${#WATCHED_FILES[@]}"
+
     cat > /usr/local/sbin/vps-log-integrity << 'INTEGRITY_EOF'
 #!/bin/bash
 STATE_DIR="/var/lib/vps-hardening"
@@ -1298,9 +1564,12 @@ WATCHED=(
     /etc/passwd
     /etc/shadow
     /etc/group
+    /etc/hosts
+    /etc/crontab
 )
 
 mkdir -p "$STATE_DIR"
+mkdir -p "$(dirname "$LOGFILE")"
 
 if [[ ! -f "$BASELINE" ]]; then
     sha256sum "${WATCHED[@]}" 2>/dev/null > "$BASELINE"
@@ -1317,6 +1586,9 @@ if [[ -n "$DIFF" ]]; then
     echo "$DIFF" >> "$LOGFILE"
     logger -t vps-integrity -p auth.alert \
         "INTEGRITY ALERT: Critical file changed — check ${LOGFILE}"
+    # Update baseline to avoid alert spam — admin is expected to review log
+    sha256sum "${WATCHED[@]}" 2>/dev/null > "${BASELINE}.new"
+    mv "${BASELINE}.new" "$BASELINE"
 else
     echo "${TS} OK: All ${#WATCHED[@]} files match baseline" >> "$LOGFILE"
 fi
@@ -1324,7 +1596,7 @@ INTEGRITY_EOF
     chmod 750 /usr/local/sbin/vps-log-integrity
 
     /usr/local/sbin/vps-log-integrity
-    log_ok "Integrity baseline created (${#WATCHED[@]:-7} files)"
+    log_ok "Integrity baseline created (${WATCHED_COUNT} files watched)"
 
     local CRON_INTEG="0 5 * * * /usr/local/sbin/vps-log-integrity"
     ( crontab -l 2>/dev/null || true ) \
@@ -1333,6 +1605,7 @@ INTEGRITY_EOF
     log_ok "Integrity check: daily 05:00"
 
     phase_done "07"
+    print_phase_done "07"
 }
 
 # =============================================================================
@@ -1342,10 +1615,10 @@ INTEGRITY_EOF
 phase_08() {
     print_phase "08" "Package Cleanup" "Less software = fewer vulnerabilities"
 
-    phase_complete "08" && { log_ok "Phase 08 done — skipping"; return 0; }
+    phase_complete "08" && { log_ok "Phase 08 done — skipping"; print_phase_done "08"; return 0; }
 
     local REMOVE=()
-    for PKG in nfs-common open-iscsi ssh-import-id; do
+    for PKG in nfs-common open-iscsi ssh-import-id telnet netcat-traditional ftp; do
         dpkg -l "$PKG" 2>/dev/null | grep -q "^ii" && REMOVE+=("$PKG")
     done
 
@@ -1358,9 +1631,13 @@ phase_08() {
     run_silent "Running autoremove" \
         bash -c 'DEBIAN_FRONTEND=noninteractive apt-get autoremove -y -qq'
 
+    run_silent "Cleaning apt cache" \
+        bash -c 'apt-get clean -qq'
+
     echo ""
     log_ok "Cleanup: ${#REMOVE[@]} package(s) removed"
     phase_done "08"
+    print_phase_done "08"
 }
 
 # =============================================================================
@@ -1371,7 +1648,7 @@ phase_09() {
     print_phase "09" "Automatic Security Updates" \
         "Security patches daily — safe auto-reboot at 03:00"
 
-    phase_complete "09" && { log_ok "Phase 09 done — skipping"; return 0; }
+    phase_complete "09" && { log_ok "Phase 09 done — skipping"; print_phase_done "09"; return 0; }
 
     policy_block_start
     run_silent "Installing unattended-upgrades" \
@@ -1391,6 +1668,7 @@ Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
 Unattended-Upgrade::Automatic-Reboot "false";
 Unattended-Upgrade::SyslogEnable "true";
 Unattended-Upgrade::Verbose "false";
+Unattended-Upgrade::Mail "root";
 EOF
 
     cat > /etc/apt/apt.conf.d/20auto-upgrades << 'EOF'
@@ -1406,7 +1684,6 @@ EOF
         > /dev/null 2>&1 || true
     log_ok "APT daily timers enabled"
 
-    # Safe auto-reboot helper
     cat > /usr/local/sbin/vps-safe-reboot << 'REBOOT_EOF'
 #!/bin/bash
 LOGFILE="/var/log/vps-hardening/reboot.log"
@@ -1464,6 +1741,7 @@ EOF
     fi
 
     phase_done "09"
+    print_phase_done "09"
 }
 
 # =============================================================================
@@ -1473,11 +1751,12 @@ EOF
 phase_10() {
     print_phase "10" "Kernel Hardening" "sysctl — stops network attacks + hardens memory"
 
-    phase_complete "10" && { log_ok "Phase 10 done — skipping"; return 0; }
+    phase_complete "10" && { log_ok "Phase 10 done — skipping"; print_phase_done "10"; return 0; }
 
     if [[ "$ENABLE_SYSCTL" != "true" ]]; then
         log_info "Kernel sysctl hardening skipped (not selected)"
         phase_done "10"
+        print_phase_done "10"
         return 0
     fi
 
@@ -1485,75 +1764,60 @@ phase_10() {
 # vps-hardening sysctl — network + memory hardening
 
 # ── Network: Stop common attack vectors ──────────────────────────────────────
-# Ignore ICMP redirects (MITM vector)
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
-
-# Ignore source-routed packets (spoofing)
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 net.ipv6.conf.all.accept_source_route = 0
-
-# Reverse path filtering (stops spoofed source IPs)
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
-
-# Ignore broadcast pings (Smurf attack)
 net.ipv4.icmp_echo_ignore_broadcasts = 1
-
-# Ignore bogus ICMP errors
 net.ipv4.icmp_ignore_bogus_error_responses = 1
-
-# SYN flood protection
 net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_syn_retries = 2
 net.ipv4.tcp_synack_retries = 2
 net.ipv4.tcp_max_syn_backlog = 4096
-
-# Disable IPv6 if not used (reduces attack surface)
-# Uncomment if you don't use IPv6:
-# net.ipv6.conf.all.disable_ipv6 = 1
-# net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv4.tcp_timestamps = 0
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
 
 # ── Memory: Stop exploitation techniques ─────────────────────────────────────
-# Prevent SUID program core dumps (can expose crypto keys)
 fs.suid_dumpable = 0
-
-# ASLR — randomize memory layout (hardens buffer overflows)
 kernel.randomize_va_space = 2
-
-# Restrict /proc to process owner (stops cross-user info leak)
 kernel.dmesg_restrict = 1
-
-# Restrict kernel pointer exposure (stops KASLR bypass)
 kernel.kptr_restrict = 2
-
-# Disable SysRq in production
 kernel.sysrq = 0
-
-# Restrict perf events (privilege escalation vector)
 kernel.perf_event_paranoid = 3
+kernel.unprivileged_bpf_disabled = 1
+net.core.bpf_jit_harden = 2
+kernel.yama.ptrace_scope = 1
 
 # ── Filesystem ────────────────────────────────────────────────────────────────
-# Protect hardlinks and symlinks (stops symlink attacks)
 fs.protected_hardlinks = 1
 fs.protected_symlinks = 1
 fs.protected_fifos = 1
 fs.protected_regular = 2
+
+# ── Network performance + security ───────────────────────────────────────────
+net.core.somaxconn = 1024
+net.ipv4.tcp_rfc1337 = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_keepalive_intvl = 15
 EOF
 
     run_silent "Applying sysctl settings" \
         bash -c 'sysctl --system > /dev/null 2>&1'
 
-    local APPLIED
-    APPLIED=$(sysctl --system 2>/dev/null | grep -c "=" || echo 0)
     log_ok "Kernel hardening applied — settings persist across reboots"
 
     phase_done "10"
+    print_phase_done "10"
 }
 
 # =============================================================================
@@ -1564,14 +1828,13 @@ phase_11() {
     print_phase "11" "Kernel Audit Logging" \
         "auditd — kernel-level activity that rootkits cannot hide from"
 
-    phase_complete "11" && { log_ok "Phase 11 done — skipping"; return 0; }
+    phase_complete "11" && { log_ok "Phase 11 done — skipping"; print_phase_done "11"; return 0; }
 
     if [[ "$ENABLE_AUDITD" != "true" ]]; then
         log_info "auditd skipped (not selected)"
-
-        # Optional tools
         _install_optional_tools
         phase_done "11"
+        print_phase_done "11"
         return 0
     fi
 
@@ -1602,7 +1865,7 @@ phase_11() {
 -w /etc/ssh/sshd_config.d/  -p wa -k sshd
 
 # ── Privilege escalation ──────────────────────────────────────────────────────
--a always,exit -F arch=b64 -S setuid   -F a0=0 -F exe=/usr/bin/su -k su-root
+-a always,exit -F arch=b64 -S setuid    -F a0=0 -F exe=/usr/bin/su -k su-root
 -a always,exit -F arch=b64 -S setresuid -k privilege-escalation
 -a always,exit -F arch=b32 -S setresuid -k privilege-escalation
 
@@ -1622,7 +1885,11 @@ phase_11() {
 -a always,exit -F arch=b64 -S connect -k network-connect
 -a always,exit -F arch=b32 -S connect -k network-connect
 
-# ── Immutable (require reboot to change rules) ────────────────────────────────
+# ── File deletions ────────────────────────────────────────────────────────────
+-a always,exit -F arch=b64 -S unlink -S unlinkat -S rename -S renameat -k delete
+-a always,exit -F arch=b32 -S unlink -S unlinkat -S rename -S renameat -k delete
+
+# ── Immutable ─────────────────────────────────────────────────────────────────
 -e 2
 EOF
 
@@ -1641,6 +1908,7 @@ EOF
 
     _install_optional_tools
     phase_done "11"
+    print_phase_done "11"
 }
 
 # Optional tools: rkhunter, chkrootkit, clamav, aide
@@ -1744,9 +2012,8 @@ phase_12() {
     print_phase "12" "Admin Account + Final Lockdown" \
         "Create account → test → lock root → close port 22"
 
-    phase_complete "12" && { log_ok "Phase 12 done — skipping"; return 0; }
+    phase_complete "12" && { log_ok "Phase 12 done — skipping"; print_phase_done "12"; return 0; }
 
-    # Create account
     if id "$INPUT_USERNAME" > /dev/null 2>&1; then
         log_warn "User $INPUT_USERNAME already exists — skipping creation"
     else
@@ -1759,6 +2026,15 @@ phase_12() {
     run_silent "Adding $INPUT_USERNAME to sudo + adm" bash -c "
         usermod -aG sudo $INPUT_USERNAME
         usermod -aG adm  $INPUT_USERNAME"
+
+    # Set up sudo with password (no NOPASSWD for new admin)
+    cat > "/etc/sudoers.d/99-${INPUT_USERNAME}" << EOF
+# vps-hardening: $INPUT_USERNAME sudo config
+$INPUT_USERNAME ALL=(ALL:ALL) ALL
+Defaults:$INPUT_USERNAME timestamp_timeout=5
+EOF
+    chmod 440 "/etc/sudoers.d/99-${INPUT_USERNAME}"
+    log_ok "sudo configured for $INPUT_USERNAME (5-min timeout)"
 
     # SSH key for new account
     mkdir -p "/home/$INPUT_USERNAME/.ssh"
@@ -1791,7 +2067,10 @@ phase_12() {
 
     chown -R "$INPUT_USERNAME:$INPUT_USERNAME" "/home/$INPUT_USERNAME/.ssh"
 
-    # Test
+    # Harden home directory permissions
+    chmod 750 "/home/$INPUT_USERNAME"
+    log_ok "Home directory permissions: 750"
+
     print_box "TEST YOUR NEW ACCOUNT" "$YELLOW"
     echo -e "  Open a NEW terminal:"
     if [[ "$AUTH_TYPE" == "key" ]]; then
@@ -1809,7 +2088,6 @@ phase_12() {
     if [[ "$ACCT_TEST" != "yes" ]]; then
         log_error "Test failed — lockdown NOT applied. Root preserved."
         log_info "Diagnose: id $INPUT_USERNAME | passwd $INPUT_USERNAME"
-        log_info "Manual lockdown commands printed to log"
         {
             echo "sudo sed -i 's/PermitRootLogin yes/PermitRootLogin no/' \\"
             echo "    /etc/ssh/sshd_config.d/99-hardened.conf"
@@ -1823,6 +2101,11 @@ phase_12() {
     fi
 
     # Write final SSH config
+    local CRYPTO_BLOCK="KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
+HostKeyAlgorithms ssh-ed25519,rsa-sha2-512,rsa-sha2-256
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com"
+
     if [[ "$AUTH_TYPE" == "key" ]]; then
         cat > /etc/ssh/sshd_config.d/99-hardened.conf << EOF
 # FINAL hardened SSH — vps-hardening ${VPS_VERSION} — $(date)
@@ -1838,18 +2121,19 @@ MaxSessions 2
 LoginGraceTime 30
 ClientAliveInterval 300
 ClientAliveCountMax 3
+TCPKeepAlive no
 X11Forwarding no
 AllowAgentForwarding no
 AllowTcpForwarding no
 PermitUserEnvironment no
 PermitUserRC no
 DisableForwarding yes
+PrintMotd no
+PrintLastLog yes
+Banner /etc/issue.net
 LogLevel VERBOSE
 AllowUsers $INPUT_USERNAME
-KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
-HostKeyAlgorithms ssh-ed25519,rsa-sha2-512,rsa-sha2-256
-Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
-MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
+${CRYPTO_BLOCK}
 EOF
     else
         cat > /etc/ssh/sshd_config.d/99-hardened.conf << EOF
@@ -1865,32 +2149,34 @@ MaxSessions 2
 LoginGraceTime 30
 ClientAliveInterval 300
 ClientAliveCountMax 3
+TCPKeepAlive no
 X11Forwarding no
 AllowAgentForwarding no
 AllowTcpForwarding no
 PermitUserEnvironment no
 PermitUserRC no
 DisableForwarding yes
+PrintMotd no
+PrintLastLog yes
+Banner /etc/issue.net
 LogLevel VERBOSE
 AllowUsers $INPUT_USERNAME
-KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512
-HostKeyAlgorithms ssh-ed25519,rsa-sha2-512,rsa-sha2-256
-Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
-MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
+${CRYPTO_BLOCK}
 EOF
     fi
 
     if sshd -t 2>/dev/null; then
         run_silent "Applying final SSH lockdown" systemctl restart ssh
         log_ok "Root login disabled — only ${BOLD}$INPUT_USERNAME${NC} can log in"
-        ufw delete allow 22/tcp > /dev/null 2>&1 || true
+        ufw delete allow 22/tcp   > /dev/null 2>&1 || true
+        ufw delete limit 22/tcp   > /dev/null 2>&1 || true
         log_ok "Port 22 closed — only ${BOLD}$INPUT_SSH_PORT${NC} accessible"
     else
         log_error "SSH config error — keeping safe config, NOT restarting"
     fi
 
     # Demote cloud user
-    if [[ "$INPUT_CLOUD_USER" != "root" ]]; then
+    if [[ "$INPUT_CLOUD_USER" != "root" && "$INPUT_CLOUD_USER" != "$INPUT_USERNAME" ]]; then
         for GRP in sudo lxd cdrom dip; do
             deluser "$INPUT_CLOUD_USER" "$GRP" 2>/dev/null || true
         done
@@ -1901,15 +2187,15 @@ EOF
     # Remove NOPASSWD from cloud sudoers
     local SUDOERS_FILE=""
     for F in /etc/sudoers.d/*; do
-        grep -q "$INPUT_CLOUD_USER" "$F" 2>/dev/null \
+        grep -q "${INPUT_CLOUD_USER}" "$F" 2>/dev/null \
             && { SUDOERS_FILE="$F"; break; }
     done
 
     if [[ -n "$SUDOERS_FILE" ]]; then
         local TMP_SUDOERS
         TMP_SUDOERS=$(mktemp)
-        sed "s|$INPUT_CLOUD_USER ALL=(ALL) NOPASSWD:ALL|$INPUT_CLOUD_USER ALL=(ALL) ALL|g;
-             s|$INPUT_CLOUD_USER ALL=(ALL:ALL) NOPASSWD:ALL|$INPUT_CLOUD_USER ALL=(ALL:ALL) ALL|g" \
+        sed "s|${INPUT_CLOUD_USER} ALL=(ALL) NOPASSWD:ALL|${INPUT_CLOUD_USER} ALL=(ALL) ALL|g;
+             s|${INPUT_CLOUD_USER} ALL=(ALL:ALL) NOPASSWD:ALL|${INPUT_CLOUD_USER} ALL=(ALL:ALL) ALL|g" \
             "$SUDOERS_FILE" > "$TMP_SUDOERS"
 
         if visudo -c -f "$TMP_SUDOERS" > /dev/null 2>&1; then
@@ -1923,6 +2209,7 @@ EOF
     fi
 
     phase_done "12"
+    print_phase_done "12"
 }
 
 # =============================================================================
@@ -1933,7 +2220,7 @@ phase_13() {
     print_phase "13" "Security Monitoring" \
         "Daily audit + check-alerts dashboard"
 
-    phase_complete "13" && { log_ok "Phase 13 done — skipping"; return 0; }
+    phase_complete "13" && { log_ok "Phase 13 done — skipping"; print_phase_done "13"; return 0; }
 
     local SCRIPTS_DIR="/opt/${INPUT_HOSTNAME}/scripts"
     local BASELINE_DIR="/opt/${INPUT_HOSTNAME}/baseline"
@@ -2022,6 +2309,9 @@ echo "--- Sudo (24h) ---"
 journalctl --since '24 hours ago' 2>/dev/null \
     | grep 'sudo' | grep -v 'pam_unix' || true
 
+echo "--- New/Modified files in /etc (24h) ---"
+find /etc -newer /etc/passwd -type f 2>/dev/null | head -20 || true
+
 echo ""
 } >> "\$LOGFILE"
 AUDIT_EOF
@@ -2037,6 +2327,8 @@ ENABLE_AUDITD="${ENABLE_AUDITD}"
 ENABLE_RKHUNTER="${ENABLE_RKHUNTER}"
 ENABLE_CLAMAV="${ENABLE_CLAMAV}"
 ENABLE_AIDE="${ENABLE_AIDE}"
+SSH_PORT="${INPUT_SSH_PORT}"
+ADMIN_USER="${INPUT_USERNAME}"
 ENV_EOF
     chmod 640 "${SCRIPTS_DIR}/.check-alerts-env"
 
@@ -2055,12 +2347,14 @@ CYAN='\033[0;36m'; BLUE='\033[0;34m'; WHITE='\033[1;37m'
 BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
 
 ALERTS=0; WARNINGS=0
+ALERT_LIST=()
+WARN_LIST=()
 
 check() {
     case "$1" in
         ok)   echo -e "  ${GREEN}✓${NC}  $2" ;;
-        warn) echo -e "  ${YELLOW}⚠${NC}  $2"; WARNINGS=$((WARNINGS+1)) ;;
-        crit) echo -e "  ${RED}✗${NC}  $2";    ALERTS=$((ALERTS+1)) ;;
+        warn) echo -e "  ${YELLOW}⚠${NC}  $2"; WARNINGS=$((WARNINGS+1)); WARN_LIST+=("$2") ;;
+        crit) echo -e "  ${RED}✗${NC}  $2";    ALERTS=$((ALERTS+1)); ALERT_LIST+=("$2") ;;
         info) echo -e "  ${CYAN}ℹ${NC}  $2" ;;
     esac
 }
@@ -2068,13 +2362,15 @@ check() {
 section() {
     echo ""
     echo -e "  ${BOLD}${WHITE}$1${NC}"
+    echo -e "  ${DIM}$(printf '%.0s─' {1..54})${NC}"
     echo ""
 }
 
+clear
 echo ""
 echo -e "${BOLD}${CYAN}  ╔══════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BOLD}${CYAN}  ║${NC}  ${BOLD}${WHITE}🛡️  Security Status — $(hostname)${NC}"
-echo -e "${BOLD}${CYAN}  ║${NC}  ${DIM}$(date '+%Y-%m-%d %H:%M:%S') • $(uptime -p 2>/dev/null)${NC}"
+echo -e "${BOLD}${CYAN}  ║${NC}  ${DIM}$(date '+%Y-%m-%d %H:%M:%S') • $(uptime -p 2>/dev/null) • vps-hardening ${VPS_VERSION}${NC}"
 echo -e "${BOLD}${CYAN}  ╚══════════════════════════════════════════════════════════╝${NC}"
 
 # ── System ────────────────────────────────────────────────────────────────────
@@ -2098,36 +2394,60 @@ else
 fi
 
 if systemctl is-enabled --quiet apt-daily-upgrade.timer 2>/dev/null; then
-    check "ok" "Auto security updates: active"
+    LAST_RUN=$(stat -c %y /var/log/unattended-upgrades/ 2>/dev/null | cut -d' ' -f1 || echo "unknown")
+    check "ok" "Auto security updates: active (last: $LAST_RUN)"
 else
     check "warn" "Auto security updates: not active"
 fi
 
+TZ_NOW=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "unknown")
+NTP=$(timedatectl show --property=NTPSynchronized --value 2>/dev/null || echo "no")
+[[ "$NTP" == "yes" ]] \
+    && check "ok" "Time: ${TZ_NOW} — NTP synced" \
+    || check "warn" "Time: ${TZ_NOW} — NTP NOT synced"
+
 # ── Resources ─────────────────────────────────────────────────────────────────
 section "Resources"
 DISK=$(df / | tail -1 | awk '{print $5}' | tr -d '%')
-if   [ "$DISK" -gt 80 ]; then check "crit" "Disk: ${DISK}% — critically full"
-elif [ "$DISK" -gt 60 ]; then check "warn" "Disk: ${DISK}% — getting full"
-else                           check "ok"   "Disk: ${DISK}%"
+DISK_FREE=$(df -h / | tail -1 | awk '{print $4}')
+if   [ "$DISK" -gt 80 ]; then check "crit" "Disk: ${DISK}% used — ${DISK_FREE} free (critical)"
+elif [ "$DISK" -gt 60 ]; then check "warn" "Disk: ${DISK}% used — ${DISK_FREE} free"
+else                           check "ok"   "Disk: ${DISK}% used — ${DISK_FREE} free"
 fi
 
 MEM=$(free | grep Mem | awk '{printf "%.0f", $3/$2*100}')
-if   [ "$MEM" -gt 90 ]; then check "crit" "Memory: ${MEM}%"
-elif [ "$MEM" -gt 75 ]; then check "warn" "Memory: ${MEM}%"
-else                          check "ok"   "Memory: ${MEM}%"
+MEM_FREE=$(free -h | grep Mem | awk '{print $7}')
+if   [ "$MEM" -gt 90 ]; then check "crit" "Memory: ${MEM}% — ${MEM_FREE} available"
+elif [ "$MEM" -gt 75 ]; then check "warn" "Memory: ${MEM}% — ${MEM_FREE} available"
+else                          check "ok"   "Memory: ${MEM}% — ${MEM_FREE} available"
 fi
 
 LOAD=$(awk '{print $1}' /proc/loadavg)
+LOAD5=$(awk '{print $2}' /proc/loadavg)
+LOAD15=$(awk '{print $3}' /proc/loadavg)
 CORES=$(nproc)
-check "info" "Load: $LOAD ($CORES cores)"
+check "info" "Load avg: ${LOAD} ${LOAD5} ${LOAD15} (${CORES} cores)"
 
 # ── Intrusion protection ──────────────────────────────────────────────────────
 section "Intrusion Protection"
 FAILED=$(journalctl -u ssh --since "24 hours ago" 2>/dev/null \
     | grep -c "Invalid user\|Failed password" || echo 0)
-if   [ "$FAILED" -gt 200 ]; then check "crit" "Failed SSH (24h): $FAILED — investigate"
+if   [ "$FAILED" -gt 200 ]; then check "crit" "Failed SSH (24h): $FAILED — investigate immediately"
 elif [ "$FAILED" -gt 50  ]; then check "warn" "Failed SSH (24h): $FAILED"
 else                              check "ok"   "Failed SSH (24h): $FAILED"
+fi
+
+# Top attacking IPs
+if [ "$FAILED" -gt 10 ]; then
+    echo ""
+    echo -e "  ${DIM}  Top attacking IPs (24h):${NC}"
+    journalctl -u ssh --since "24 hours ago" 2>/dev/null \
+        | grep -oE "from [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" \
+        | awk '{print $2}' | sort | uniq -c | sort -rn | head -5 \
+        | while read -r COUNT IP; do
+            echo -e "    ${RED}$IP${NC} ${DIM}— $COUNT attempts${NC}"
+        done
+    echo ""
 fi
 
 if fail2ban-client ping > /dev/null 2>&1; then
@@ -2137,16 +2457,26 @@ if fail2ban-client ping > /dev/null 2>&1; then
         | grep "Total banned" | awk '{print $NF}')
     BANS="${BANS:-0}"; TOTAL="${TOTAL:-0}"
     if [ "$BANS" -gt 0 ]; then
-        check "info" "fail2ban: $BANS banned now ($TOTAL total)"
+        check "info" "fail2ban: ${BOLD}$BANS${NC} banned now ($TOTAL total all-time)"
         fail2ban-client status sshd 2>/dev/null \
             | grep "Banned IP" | cut -d: -f2 \
-            | tr ' ' '\n' | grep -v "^$" | head -10 \
-            | while read -r IP; do echo -e "    ${DIM}$IP${NC}"; done
+            | tr ' ' '\n' | grep -v "^$" | head -5 \
+            | while read -r IP; do echo -e "    ${DIM}  $IP${NC}"; done
     else
-        check "ok" "fail2ban: None banned now ($TOTAL total)"
+        check "ok" "fail2ban: None banned now ($TOTAL total all-time)"
     fi
 else
     check "crit" "fail2ban not responding"
+fi
+
+# Recidive jail status
+if fail2ban-client status recidive > /dev/null 2>&1; then
+    REC_BANS=$(fail2ban-client status recidive 2>/dev/null \
+        | grep "Currently banned" | awk '{print $NF}')
+    REC_BANS="${REC_BANS:-0}"
+    [ "$REC_BANS" -gt 0 ] \
+        && check "info" "Recidive (7-day) jail: $REC_BANS repeat offender(s)" \
+        || check "ok"   "Recidive jail: no repeat offenders"
 fi
 
 # ── File integrity ────────────────────────────────────────────────────────────
@@ -2173,10 +2503,13 @@ INTEG_LOG="/var/log/vps-hardening/integrity.log"
 if [[ -f "$INTEG_LOG" ]]; then
     LAST=$(tail -1 "$INTEG_LOG")
     if echo "$LAST" | grep -qi "alert"; then
-        check "crit" "Integrity: $LAST"
+        check "crit" "Integrity: ALERT — critical file changed"
+        echo -e "  ${DIM}  $LAST${NC}"
     else
         check "ok" "Integrity: $(echo "$LAST" | cut -c1-60)"
     fi
+else
+    check "warn" "Integrity log not found — run vps-log-integrity"
 fi
 
 if [[ "${ENABLE_AIDE:-false}" == "true" ]] \
@@ -2210,12 +2543,12 @@ section "Critical Services"
 for SVC in ssh fail2ban; do
     systemctl is-active --quiet "$SVC" 2>/dev/null \
         && check "ok" "$SVC running" \
-        || check "crit" "$SVC NOT running"
+        || check "crit" "$SVC NOT running — systemctl start $SVC"
 done
 
 ufw status 2>/dev/null | grep -q "Status: active" \
     && check "ok" "UFW active" \
-    || check "crit" "UFW NOT active"
+    || check "crit" "UFW NOT active — ufw enable"
 
 command -v aa-status > /dev/null 2>&1 && {
     ENF=$(aa-status 2>/dev/null \
@@ -2229,13 +2562,30 @@ command -v aa-status > /dev/null 2>&1 && {
         || check "warn" "auditd not running"
 }
 
+# Check SSH is only on hardened port
+SSH_PORTS=$(ss -tlnp | grep sshd | awk '{print $4}' | rev | cut -d: -f1 | rev | tr '\n' ' ')
+check "info" "SSH listening on: ${SSH_PORTS:-unknown}"
+if echo "$SSH_PORTS" | grep -qw "22"; then
+    check "warn" "Port 22 still open — expected only ${SSH_PORT:-custom}"
+fi
+
+# ── Recent logins ─────────────────────────────────────────────────────────────
+section "Recent Logins"
+last -n 8 --time-format iso 2>/dev/null \
+    | grep -v "^$\|^wtmp" \
+    | while IFS= read -r line; do
+        if echo "$line" | grep -qE "pts|tty"; then
+            echo -e "  ${DIM}$line${NC}"
+        fi
+    done || echo -e "  ${DIM}No recent logins${NC}"
+
 # ── Audit log tail ────────────────────────────────────────────────────────────
 section "Recent Audit (last 5 lines)"
 [[ -f "${AUDIT_LOG}" ]] \
     && tail -5 "${AUDIT_LOG}" | while IFS= read -r L; do
         echo -e "  ${DIM}$L${NC}"
     done \
-    || echo -e "  ${DIM}No audit log yet${NC}"
+    || echo -e "  ${DIM}No audit log yet — run: sudo vps-audit${NC}"
 
 # ── Ports ─────────────────────────────────────────────────────────────────────
 section "Listening Ports"
@@ -2248,14 +2598,19 @@ done
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo -e "  ${DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-if   [ "$ALERTS"   -gt 0 ]; then
-    echo -e "  ${RED}✗  $ALERTS critical alert(s) — action required${NC}"
+echo ""
+if [ "$ALERTS" -gt 0 ]; then
+    echo -e "  ${RED}${BOLD}✗  $ALERTS critical alert(s) require immediate action:${NC}"
+    for A in "${ALERT_LIST[@]}"; do echo -e "     ${RED}• $A${NC}"; done
 elif [ "$WARNINGS" -gt 0 ]; then
-    echo -e "  ${YELLOW}⚠  $WARNINGS warning(s) — review when possible${NC}"
+    echo -e "  ${YELLOW}${BOLD}⚠  $WARNINGS warning(s) — review when possible:${NC}"
+    for W in "${WARN_LIST[@]}"; do echo -e "     ${YELLOW}• $W${NC}"; done
 else
-    echo -e "  ${GREEN}✓  All systems healthy${NC}"
+    echo -e "  ${GREEN}${BOLD}✓  All systems healthy — no alerts${NC}"
 fi
-echo -e "  ${DIM}vps-hardening ${VPS_VERSION} | Log: ${AUDIT_LOG}${NC}"
+echo ""
+echo -e "  ${DIM}Commands: sudo vps-audit | sudo fail2ban-client status sshd | sudo ufw status${NC}"
+echo -e "  ${DIM}Log: ${AUDIT_LOG}${NC}"
 echo ""
 ALERTS_EOF
 
@@ -2284,11 +2639,145 @@ ALERTS_EOF
 
     log_ok "Monitoring ready — run ${BOLD}${CYAN}sudo check-alerts${NC}"
     phase_done "13"
+    print_phase_done "13"
+}
+
+# =============================================================================
+# PHASE 14 — LOGIN BANNER + MOTD + SSH FINGERPRINT RECORD
+# =============================================================================
+
+phase_14() {
+    print_phase "14" "Login Banner + MOTD + Hardening Record" \
+        "Legal warning banner + dynamic MOTD + SSH fingerprint file"
+
+    phase_complete "14" && { log_ok "Phase 14 done — skipping"; print_phase_done "14"; return 0; }
+
+    # /etc/issue.net — shown by SSH before login (referenced in sshd_config Banner)
+    cat > /etc/issue.net << EOF
+╔══════════════════════════════════════════════════════════╗
+║  WARNING: UNAUTHORIZED ACCESS PROHIBITED                 ║
+╠══════════════════════════════════════════════════════════╣
+║  ${BANNER_TEXT:0:54}
+║                                                          ║
+║  All activity is monitored and logged.                   ║
+║  Violators will be prosecuted to the full extent of law. ║
+╚══════════════════════════════════════════════════════════╝
+EOF
+    chmod 644 /etc/issue.net
+    log_ok "SSH pre-login banner written to /etc/issue.net"
+
+    # /etc/issue — shown on local console
+    cp /etc/issue.net /etc/issue
+    log_ok "Console banner written to /etc/issue"
+
+    # Dynamic MOTD — shown after login
+    # Disable default Ubuntu MOTD components that are noisy
+    if [[ -d /etc/update-motd.d ]]; then
+        for F in /etc/update-motd.d/*; do
+            chmod -x "$F" 2>/dev/null || true
+        done
+        log_ok "Default Ubuntu MOTD components disabled"
+    fi
+
+    cat > /etc/update-motd.d/01-vps-hardening << 'MOTD_EOF'
+#!/bin/bash
+# Dynamic MOTD — vps-hardening
+
+RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
+CYAN='\033[0;36m'; WHITE='\033[1;37m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
+
+HOST=$(hostname -s)
+KERNEL=$(uname -r)
+UPTIME=$(uptime -p 2>/dev/null || uptime)
+DISK=$(df -h / | tail -1 | awk '{print $5 " used (" $4 " free)"}')
+MEM=$(free -h | grep Mem | awk '{print $3 " / " $2}')
+LOAD=$(awk '{print $1, $2, $3}' /proc/loadavg)
+LAST_LOGIN=$(last -n 2 --time-format iso "$USER" 2>/dev/null | grep -v "^$\|still" | tail -1)
+TZ=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "UTC")
+
+# Quick security pulse
+FAILED_SSH=$(journalctl -u ssh --since "24 hours ago" 2>/dev/null \
+    | grep -c 'Invalid user\|Failed password' 2>/dev/null || echo "?")
+BANNED=$(fail2ban-client status sshd 2>/dev/null \
+    | grep "Currently banned" | awk '{print $NF}' 2>/dev/null || echo "?")
+REBOOT_NEEDED=""
+[[ -f /var/run/reboot-required ]] && REBOOT_NEEDED="${YELLOW}⚠ Reboot required${NC}"
+
+echo ""
+echo -e "${BOLD}${CYAN}  ┌─────────────────────────────────────────────────────────┐${NC}"
+echo -e "${BOLD}${CYAN}  │${NC}  ${BOLD}${WHITE}${HOST}${NC}  ${DIM}— Secured by vps-hardening${NC}"
+echo -e "${BOLD}${CYAN}  └─────────────────────────────────────────────────────────┘${NC}"
+echo ""
+printf "  ${DIM}%-12s${NC} %s\n" "Kernel"  "$KERNEL"
+printf "  ${DIM}%-12s${NC} %s\n" "Uptime"  "$UPTIME"
+printf "  ${DIM}%-12s${NC} %s\n" "Load"    "$LOAD"
+printf "  ${DIM}%-12s${NC} %s\n" "Disk"    "$DISK"
+printf "  ${DIM}%-12s${NC} %s\n" "Memory"  "$MEM"
+printf "  ${DIM}%-12s${NC} %s\n" "Timezone" "$TZ"
+echo ""
+echo -e "  ${BOLD}${WHITE}Security Pulse (24h):${NC}"
+[[ "$FAILED_SSH" -gt 50 ]] 2>/dev/null \
+    && printf "  ${RED}%-12s${NC} %s\n" "SSH fails"  "$FAILED_SSH ⚠" \
+    || printf "  ${DIM}%-12s${NC} %s\n" "SSH fails"  "$FAILED_SSH"
+printf "  ${DIM}%-12s${NC} %s\n" "Banned IPs" "${BANNED:-0}"
+[[ -n "$REBOOT_NEEDED" ]] && echo -e "  $REBOOT_NEEDED"
+echo ""
+[[ -n "$LAST_LOGIN" ]] \
+    && echo -e "  ${DIM}Last login: $LAST_LOGIN${NC}" \
+    || true
+echo -e "  ${DIM}Run ${NC}${CYAN}sudo check-alerts${NC}${DIM} for full security status${NC}"
+echo ""
+MOTD_EOF
+    chmod +x /etc/update-motd.d/01-vps-hardening
+    log_ok "Dynamic MOTD installed"
+
+    # SSH fingerprint record
+    local FINGERPRINT_FILE="${VPS_STATE_DIR}/ssh-fingerprints.txt"
+    {
+        echo "# SSH Host Key Fingerprints — $(hostname) — $(date)"
+        echo "# Verify these when connecting to confirm you are on the right server"
+        echo ""
+        for KEY in /etc/ssh/ssh_host_*.pub; do
+            [[ -f "$KEY" ]] || continue
+            ALGO=$(echo "$KEY" | grep -oP 'ssh_host_\K[^.]+')
+            FP=$(ssh-keygen -l -f "$KEY" 2>/dev/null || echo "unreadable")
+            echo "  $ALGO: $FP"
+        done
+    } > "$FINGERPRINT_FILE"
+    chmod 644 "$FINGERPRINT_FILE"
+    log_ok "SSH fingerprints saved: $FINGERPRINT_FILE"
+
+    echo ""
+    echo -e "  ${BOLD}SSH Host Fingerprints${NC} ${DIM}(share with users for verification)${NC}"
+    cat "$FINGERPRINT_FILE"
+
+    # Harden /etc/securetty — restrict root console logins
+    if [[ -f /etc/securetty ]]; then
+        cp /etc/securetty /etc/securetty.backup
+        # Keep only tty1 for emergency console access
+        echo "tty1" > /etc/securetty
+        log_ok "/etc/securetty restricted (console root login: tty1 only)"
+    fi
+
+    # Set idle session timeout via profile
+    cat > /etc/profile.d/99-vps-timeout.sh << 'TIMEOUT_EOF'
+# Auto-logout idle sessions after 30 minutes
+TMOUT=1800
+readonly TMOUT
+export TMOUT
+TIMEOUT_EOF
+    chmod 644 /etc/profile.d/99-vps-timeout.sh
+    log_ok "Idle session timeout: 30 minutes"
+
+    phase_done "14"
+    print_phase_done "14"
 }
 
 # =============================================================================
 # EXECUTE ALL PHASES
 # =============================================================================
+
+TOTAL_PHASES=14
 
 run_phase "01" phase_01
 run_phase "02" phase_02
@@ -2303,6 +2792,7 @@ run_phase "10" phase_10
 run_phase "11" phase_11
 run_phase "12" phase_12
 run_phase "13" phase_13
+run_phase "14" phase_14
 
 # =============================================================================
 # FINAL SUMMARY
@@ -2318,7 +2808,7 @@ echo ""
 echo -e "${BOLD}${GREEN}"
 echo "  ╔══════════════════════════════════════════════════════════╗"
 echo "  ║                                                          ║"
-echo "  ║    🛡️   VPS HARDENING COMPLETE                          ║"
+echo "  ║    🛡️   VPS HARDENING COMPLETE  v${VPS_VERSION}             ║"
 echo "  ║    Your server is secured and self-maintaining.          ║"
 echo "  ║                                                          ║"
 echo "  ╚══════════════════════════════════════════════════════════╝"
@@ -2326,23 +2816,35 @@ echo -e "${NC}"
 echo -e "  ${DIM}Completed in ${MINUTES}m ${SECS}s${NC}"
 echo ""
 
+# Phase timing summary
+echo -e "  ${BOLD}${WHITE}Phase Timings:${NC}"
+echo ""
+for ID in 01 02 03 04 05 06 07 08 09 10 11 12 13 14; do
+    DUR="${PHASE_TIMES["${ID}_duration"]:-skipped}"
+    printf "    ${DIM}Phase %s${NC}  %s\n" "$ID" "$DUR"
+done
+echo ""
+
 echo -e "  ${BOLD}${WHITE}What was applied:${NC}"
 echo ""
-echo -e "  ${GREEN}✓${NC}  ${BOLD}Firewall${NC}           Port $INPUT_SSH_PORT only"
-echo -e "  ${GREEN}✓${NC}  ${BOLD}SSH${NC}                Port + modern crypto + AllowUsers"
-echo -e "  ${GREEN}✓${NC}  ${BOLD}fail2ban${NC}           3 attempts = 24h ban"
+echo -e "  ${GREEN}✓${NC}  ${BOLD}Firewall${NC}           Port $INPUT_SSH_PORT only (rate-limited)"
+echo -e "  ${GREEN}✓${NC}  ${BOLD}SSH${NC}                Port + modern crypto + moduli + AllowUsers"
+echo -e "  ${GREEN}✓${NC}  ${BOLD}fail2ban${NC}           3 attempts = 24h ban + recidive 7-day jail"
 echo -e "  ${GREEN}✓${NC}  ${BOLD}AppArmor${NC}           Mandatory access control"
-echo -e "  ${GREEN}✓${NC}  ${BOLD}Logging${NC}            Persistent, 90-day rotation, integrity"
+echo -e "  ${GREEN}✓${NC}  ${BOLD}Logging${NC}            Persistent, 90-day rotation, integrity (9 files)"
 echo -e "  ${GREEN}✓${NC}  ${BOLD}Auto updates${NC}       Security patches daily"
 echo -e "  ${GREEN}✓${NC}  ${BOLD}Safe reboot${NC}        03:00 — only when safe"
-echo -e "  ${GREEN}✓${NC}  ${BOLD}Admin account${NC}      $INPUT_USERNAME"
+echo -e "  ${GREEN}✓${NC}  ${BOLD}Admin account${NC}      $INPUT_USERNAME (sudo with 5-min timeout)"
+echo -e "  ${GREEN}✓${NC}  ${BOLD}Timezone${NC}           $INPUT_TZ + NTP sync"
+echo -e "  ${GREEN}✓${NC}  ${BOLD}Login banner${NC}       Legal warning + dynamic MOTD + idle timeout"
+echo -e "  ${GREEN}✓${NC}  ${BOLD}SSH fingerprints${NC}   Saved to ${VPS_STATE_DIR}/ssh-fingerprints.txt"
 
 [[ "$AUTH_TYPE" == "key" ]] \
     && echo -e "  ${GREEN}✓${NC}  ${BOLD}Auth${NC}               SSH key only" \
     || echo -e "  ${YELLOW}⚠${NC}  ${BOLD}Auth${NC}               Password (add keys when possible)"
 
-[[ "$ENABLE_SYSCTL"   == "true" ]] && echo -e "  ${GREEN}✓${NC}  ${BOLD}Kernel sysctl${NC}      Network + memory hardening"
-[[ "$ENABLE_AUDITD"   == "true" ]] && echo -e "  ${GREEN}✓${NC}  ${BOLD}auditd${NC}             Kernel-level audit logging"
+[[ "$ENABLE_SYSCTL"   == "true" ]] && echo -e "  ${GREEN}✓${NC}  ${BOLD}Kernel sysctl${NC}      Network + memory hardening (expanded)"
+[[ "$ENABLE_AUDITD"   == "true" ]] && echo -e "  ${GREEN}✓${NC}  ${BOLD}auditd${NC}             Kernel-level audit logging + file deletions"
 [[ "$ENABLE_RKHUNTER" == "true" ]] && echo -e "  ${GREEN}✓${NC}  ${BOLD}rkhunter${NC}           Daily rootkit scan"
 [[ "$ENABLE_CLAMAV"   == "true" ]] && echo -e "  ${GREEN}✓${NC}  ${BOLD}ClamAV${NC}             Daily malware scan"
 [[ "$ENABLE_AIDE"     == "true" ]] && echo -e "  ${GREEN}✓${NC}  ${BOLD}AIDE${NC}               Full filesystem integrity"
@@ -2354,9 +2856,11 @@ echo -e "  ${BOLD}${WHITE}Your server:${NC}"
 echo ""
 echo -e "    ${DIM}Hostname${NC}   ${BOLD}$INPUT_HOSTNAME${NC}"
 echo -e "    ${DIM}IP${NC}         ${BOLD}$PUBLIC_IP${NC}"
+echo -e "    ${DIM}Location${NC}   $(get_geo_info "$PUBLIC_IP")"
 echo -e "    ${DIM}SSH Port${NC}   ${BOLD}$INPUT_SSH_PORT${NC}"
 echo -e "    ${DIM}Admin${NC}      ${BOLD}$INPUT_USERNAME${NC}"
 echo -e "    ${DIM}Auth${NC}       $AUTH_TYPE"
+echo -e "    ${DIM}Timezone${NC}   $INPUT_TZ"
 echo -e "    ${DIM}Provider${NC}   $CLOUD_PROVIDER"
 echo ""
 echo -e "  ${BOLD}${WHITE}Connect:${NC}"
@@ -2375,13 +2879,17 @@ echo -e "  ${DIM}━━━━━━━━━━━━━━━━━━━━━
 echo ""
 echo -e "  ${BOLD}${WHITE}Commands:${NC}"
 echo ""
-echo -e "    ${CYAN}sudo check-alerts${NC}                  ${DIM}Security dashboard${NC}"
-echo -e "    ${CYAN}sudo vps-audit${NC}                     ${DIM}Run audit now${NC}"
+echo -e "    ${CYAN}sudo check-alerts${NC}                  ${DIM}Full security dashboard${NC}"
+echo -e "    ${CYAN}sudo vps-audit${NC}                     ${DIM}Run full audit now${NC}"
 echo -e "    ${CYAN}sudo fail2ban-client status sshd${NC}   ${DIM}Banned IPs${NC}"
+echo -e "    ${CYAN}sudo fail2ban-client status recidive${NC} ${DIM}Repeat offenders${NC}"
 echo -e "    ${CYAN}sudo ufw status verbose${NC}            ${DIM}Firewall rules${NC}"
 echo -e "    ${CYAN}sudo journalctl -u ssh -n 50${NC}       ${DIM}SSH log${NC}"
+echo -e "    ${CYAN}sudo vps-log-integrity${NC}             ${DIM}Run integrity check now${NC}"
 [[ "$ENABLE_AUDITD" == "true" ]] && \
     echo -e "    ${CYAN}sudo ausearch -k identity${NC}          ${DIM}Who touched /etc/passwd${NC}"
+[[ "$ENABLE_AUDITD" == "true" ]] && \
+    echo -e "    ${CYAN}sudo ausearch -k delete${NC}            ${DIM}File deletions${NC}"
 echo -e "    ${CYAN}sudo tail -f ${VPS_INSTALL_LOG}${NC}"
 
 echo ""
@@ -2418,27 +2926,35 @@ if [[ "$ENABLE_SYSCTL" != "true" || "$ENABLE_AUDITD" != "true" ]]; then
     STEP=$((STEP+1)); echo ""
 fi
 
+echo -e "  ${YELLOW}  $STEP.${NC}  ${BOLD}Verify SSH fingerprints${NC}"
+echo -e "       ${DIM}${VPS_STATE_DIR}/ssh-fingerprints.txt${NC}"
+STEP=$((STEP+1)); echo ""
+
 echo -e "  ${YELLOW}  $STEP.${NC}  ${BOLD}Consider WireGuard VPN${NC} — hides SSH from internet entirely"
-echo -e "       ${DIM}Makes fail2ban, port-knocking, and geo-blocking unnecessary${NC}"
+echo -e "       ${DIM}Makes port-scanning and brute force impossible${NC}"
 echo ""
 
 echo -e "  ${DIM}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo -e "  ${BOLD}${WHITE}Key files:${NC}"
 echo ""
-echo -e "    ${DIM}SSH config${NC}    /etc/ssh/sshd_config.d/99-hardened.conf"
-echo -e "    ${DIM}fail2ban${NC}      /etc/fail2ban/jail.local"
-echo -e "    ${DIM}Install log${NC}   ${VPS_INSTALL_LOG}"
-echo -e "    ${DIM}Audit log${NC}     $(state_get "AUDIT_LOG" 2>/dev/null || echo "${VPS_LOG_DIR}/")"
-echo -e "    ${DIM}State${NC}         ${VPS_STATE_FILE}"
+echo -e "    ${DIM}SSH config${NC}      /etc/ssh/sshd_config.d/99-hardened.conf"
+echo -e "    ${DIM}fail2ban${NC}        /etc/fail2ban/jail.local"
+echo -e "    ${DIM}Banner${NC}          /etc/issue.net"
+echo -e "    ${DIM}MOTD${NC}            /etc/update-motd.d/01-vps-hardening"
+echo -e "    ${DIM}Fingerprints${NC}    ${VPS_STATE_DIR}/ssh-fingerprints.txt"
+echo -e "    ${DIM}Install log${NC}     ${VPS_INSTALL_LOG}"
+echo -e "    ${DIM}Audit log${NC}       $(state_get "AUDIT_LOG" 2>/dev/null || echo "${VPS_LOG_DIR}/")"
+echo -e "    ${DIM}State${NC}           ${VPS_STATE_FILE}"
+echo -e "    ${DIM}Integrity${NC}       ${VPS_STATE_DIR}/log-checksums.sha256"
 [[ "$ENABLE_SYSCTL"  == "true" ]] && \
-    echo -e "    ${DIM}sysctl${NC}        /etc/sysctl.d/99-vps-hardening.conf"
+    echo -e "    ${DIM}sysctl${NC}          /etc/sysctl.d/99-vps-hardening.conf"
 [[ "$ENABLE_AUDITD"  == "true" ]] && \
-    echo -e "    ${DIM}auditd${NC}        /etc/audit/rules.d/99-hardening.rules"
+    echo -e "    ${DIM}auditd${NC}          /etc/audit/rules.d/99-hardening.rules"
 echo ""
 echo -e "  ${BOLD}${CYAN}  Stay safe out there. 🚀${NC}"
 echo ""
 echo -e "  ${DIM}Full log: ${VPS_INSTALL_LOG}${NC}"
 echo ""
 
-_log_raw "COMPLETE" "vps-hardening finished in ${MINUTES}m ${SECS}s"
+_log_raw "COMPLETE" "vps-hardening ${VPS_VERSION} finished in ${MINUTES}m ${SECS}s"
