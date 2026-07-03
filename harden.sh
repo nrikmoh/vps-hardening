@@ -2349,9 +2349,19 @@ ENV_EOF
 #!/bin/bash
 # check-alerts.sh — vps-hardening interactive dashboard
 
+# 1. Safely resolve the real physical script directory, even if executed via a Symlink
+REAL_SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$REAL_SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$REAL_SOURCE")" && pwd)"
+    REAL_SOURCE="$(readlink "$REAL_SOURCE")"
+    [[ $REAL_SOURCE != /* ]] && REAL_SOURCE="$DIR/$REAL_SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$REAL_SOURCE")" && pwd)"
+
+# 2. Source the environment file using its true absolute path location
 # shellcheck source=/dev/null
-source "$(dirname "$0")/.check-alerts-env" 2>/dev/null || {
-    echo "Error: .check-alerts-env missing." >&2; exit 1
+source "${SCRIPT_DIR}/.check-alerts-env" 2>/dev/null || {
+    echo "Error: .check-alerts-env missing from ${SCRIPT_DIR}" >&2; exit 1
 }
 
 RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
