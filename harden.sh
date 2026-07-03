@@ -144,8 +144,13 @@ draw_progress() {
     for (( i=0; i<FILLED; i++ )); do BAR+="█"; done
     for (( i=0; i<EMPTY;  i++ )); do BAR+="░"; done
 
-    printf "\n  %%bProgress%%b  [%%b%s%%b] %%b%d%%%%b  %%bPhase %d/%d%%b  %s\n\n" \
-    "${CYAN}" "${NC}" "${GREEN}" "$BAR" "${NC}" "${BOLD}" "$PCT" "${NC}" "${DIM}" "$CURRENT" "$TOTAL" "${NC}" "$LABEL"
+    # Precise mapping of 13 specifiers to 13 variables
+    printf "\n  %sProgress%s  [%s%s%s] %s%d%%%s  %sPhase %d/%d%s  %s\n\n" \
+        "${CYAN}" "${NC}" \
+        "${GREEN}" "$BAR" "${NC}" \
+        "${BOLD}" "$PCT" "${NC}" \
+        "${DIM}" "$CURRENT" "$TOTAL" "${NC}" \
+        "$LABEL"
 }
 
 # =============================================================================
