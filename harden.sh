@@ -144,7 +144,8 @@ draw_progress() {
     for (( i=0; i<FILLED; i++ )); do BAR+="█"; done
     for (( i=0; i<EMPTY;  i++ )); do BAR+="░"; done
 
-    echo -e "\n  ${CYAN}Progress${NC}  [${GREEN}${BAR}${NC}] ${BOLD}${PCT}%%${NC}  ${DIM}Phase ${CURRENT}/${TOTAL}${NC}  ${LABEL}\n"
+    printf "\n  %%bProgress%%b  [%%b%s%%b] %%b%d%%%%b  %%bPhase %d/%d%%b  %s\n\n" \
+    "${CYAN}" "${NC}" "${GREEN}" "$BAR" "${NC}" "${BOLD}" "$PCT" "${NC}" "${DIM}" "$CURRENT" "$TOTAL" "${NC}" "$LABEL"
 }
 
 # =============================================================================
@@ -193,9 +194,11 @@ run_silent() {
     EXIT_FILE=$(mktemp)
     STDERR_FILE=$(mktemp)
 
-    ( DEBIAN_FRONTEND=noninteractive "$@" \
-        > /dev/null 2>"$STDERR_FILE"
-      echo $? > "$EXIT_FILE" ) &
+    # Use an internal trap inside the subshell to intercept unexpected deaths
+    ( 
+      trap 'echo $? > "$EXIT_FILE"' EXIT
+      DEBIAN_FRONTEND=noninteractive "$@" > /dev/null 2>"$STDERR_FILE"
+    ) &
     local PID=$!
 
     spin "$MSG" "$PID" "$EXIT_FILE"
@@ -210,7 +213,6 @@ run_silent() {
     rm -f "$EXIT_FILE" "$STDERR_FILE"
     return "$CODE"
 }
-
 # =============================================================================
 # TIMING TRACKER
 # =============================================================================
@@ -333,11 +335,14 @@ get_geo_info() {
     local IP="${1:-}"
     local GEO
     GEO=$(curl -s --max-time 5 "https://ipapi.co/${IP}/json/" 2>/dev/null || echo "{}")
-    local COUNTRY CITY ORG
-    COUNTRY=$(echo "$GEO" | grep -oP '"country_name":\s*"\K[^"]+' || echo "Unknown")
-    CITY=$(echo "$GEO"    | grep -oP '"city":\s*"\K[^"]+' || echo "Unknown")
-    ORG=$(echo "$GEO"     | grep -oP '"org":\s*"\K[^"]+' || echo "Unknown")
-    echo "${CITY}, ${COUNTRY} (${ORG})"
+    
+    # Safely extract values using sed instead of grep -oP to ensure cross-compatibility
+    local COUNTRY; COUNTRY=$(echo "$GEO" | sed -n 's/.*"country_name": *"\([^"]*\)".*/\1/p')
+    local CITY;    CITY=$(echo "$GEO" | sed -n 's/.*"city": *"\([^"]*\)".*/\1/p')
+    local ORG;     ORG=$(echo "$GEO" | sed -n 's/.*"org": *"\([^"]*\)".*/\1/p')
+
+    # Fallback default assignments if strings evaluate empty
+    echo "${CITY:-Unknown}, ${COUNTRY:-Unknown} (${ORG:-Unknown})"
 }
 
 # =============================================================================
@@ -429,6 +434,8 @@ register_temp() { _TEMP_FILES+=("$1"); }
 cleanup_on_exit() {
     for F in "${_TEMP_FILES[@]:-}"; do rm -f "$F" 2>/dev/null || true; done
     rm -f /usr/sbin/policy-rc.d 2>/dev/null || true
+    exec >&- 2>&-
+    wait 2>/dev/null || true
 }
 
 trap 'cleanup_on_exit' EXIT
