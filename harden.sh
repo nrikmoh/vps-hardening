@@ -1327,19 +1327,46 @@ LogLevel VERBOSE
 ${CRYPTO_BLOCK}
 EOF
     fi
-    log_ok "SSH config written (modern crypto + hardened settings)"
 
-    [[ "$OS_VERSION" == "24.04" ]] && apply_ssh_socket_fix
+   log_ok "SSH config written (modern crypto + hardened settings)"
 
-    if ! sshd -t 2>/dev/null; then
-        log_error "SSH config syntax error — restoring backup"
-        cp /etc/ssh/sshd_config.backup /etc/ssh/sshd_config
-        rm -f /etc/ssh/sshd_config.d/99-hardened.conf
-        exit 1
-    fi
+[[ "$OS_VERSION" == "24.04" ]] && apply_ssh_socket_fix
 
-    run_silent "Restarting SSH on port $INPUT_SSH_PORT" \
-        systemctl restart ssh
+# ================================
+# STEP 1: STATIC CONFIG VALIDATION
+# ================================
+if ! sshd -t 2>/dev/null; then
+    log_error "SSH config syntax error — restoring backup"
+    cp /etc/ssh/sshd_config.backup /etc/ssh/sshd_config
+    rm -f /etc/ssh/sshd_config.d/99-hardened.conf
+    exit 1
+fi
+
+# ================================
+# STEP 2: SAFE RESTART (NEW FIX)
+# ================================
+log_step "Testing SSH restart safety"
+
+run_silent "Restarting SSH safely" bash -c '
+    systemctl restart ssh
+    sleep 2
+'
+
+# ================================
+# STEP 3: VERIFY SSH IS BACK
+# ================================
+if ! ss -tulpn | grep -q sshd; then
+    log_error "SSH did not come back — rolling back"
+
+    cp /etc/ssh/sshd_config.backup /etc/ssh/sshd_config
+    rm -f /etc/ssh/sshd_config.d/99-hardened.conf
+
+    systemctl restart ssh
+
+    die "SSH rollback executed — server protected"
+fi
+
+log_ok "SSH restarted successfully and is listening"
 
     local SSH_UP=false
     for _i in {1..20}; do
