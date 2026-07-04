@@ -871,11 +871,22 @@ echo -e "  ${DIM}Examples: UTC  America/New_York  Europe/London  Asia/Tokyo${NC}
 echo ""
 read -rp "  Timezone [${CURRENT_TZ}]: " INPUT_TZ
 INPUT_TZ="${INPUT_TZ:-$CURRENT_TZ}"
-while ! timedatectl list-timezones 2>/dev/null | grep -qx "$INPUT_TZ"; do
-    log_warn "'$INPUT_TZ' is not a valid timezone. Check 'timedatectl list-timezones'."
+    while true; do
+    # remove accidental spaces
+    INPUT_TZ="${INPUT_TZ//[[:space:]]/}"
+
+    if timedatectl list-timezones 2>/dev/null | grep -Fxq "$INPUT_TZ"; then
+        break
+    fi
+
+    log_warn "'$INPUT_TZ' is not a valid timezone."
+
+    echo "👉 Examples: Europe/Paris, Europe/Berlin, UTC"
+    echo "👉 Press Enter to keep: $CURRENT_TZ"
+
     read -rp "  Timezone [${CURRENT_TZ}]: " INPUT_TZ
     INPUT_TZ="${INPUT_TZ:-$CURRENT_TZ}"
-done
+    done
 log_ok "Timezone: $INPUT_TZ"
 
 # ---------------------------------------------------------------------------
