@@ -462,14 +462,12 @@ print_banner() {
     clear
     echo ""
     if [[ "$_COLOR" -eq 1 ]]; then
-        echo -e "\033[0;36m"
-        echo "  ╔══════════════════════════════════════════════════════════╗"
-        echo "  ║                                                          ║"
-        echo "  ║   \033[1;37m🛡️   VPS HARDENING SCRIPT  v${VPS_VERSION}\033[0;36m               ║"
-        echo "  ║   \033[2m    Production-grade server security in one script\033[0;36m    ║"
-        echo "  ║                                                          ║"
-        echo "  ╚══════════════════════════════════════════════════════════╝"
-        echo -e "\033[0m"
+        echo $'\033[1;37m╔══════════════════════════════════════════════════════════╗\033[0m'
+        echo $'\033[1;37m║                                                          ║\033[0m'
+        echo $'\033[1;37m║   🛡️   VPS HARDENING SCRIPT  v5.0.0                     ║\033[0m'
+        echo $'\033[2m║    Production-grade server security in one script       ║\033[0m'
+        echo $'\033[1;37m║                                                          ║\033[0m'
+        echo $'\033[1;37m╚══════════════════════════════════════════════════════════╝\033[0m'
     else
         echo "  ╔══════════════════════════════════════════════════════════╗"
         echo "  ║   VPS HARDENING SCRIPT  v${VPS_VERSION}                      ║"
@@ -2043,6 +2041,21 @@ EOF
     fi
 }
 
+set_user_password() {
+    local user="$1"
+
+    while true; do
+        echo ""
+        passwd "$user"
+
+        if id "$user" >/dev/null 2>&1; then
+            echo "✅ User exists and password likely set"
+            break
+        fi
+
+        echo "❌ Password not confirmed. Retrying..."
+    done
+}
 # =============================================================================
 # PHASE 12 — ADMIN ACCOUNT + FINAL SSH LOCKDOWN
 # =============================================================================
@@ -2059,8 +2072,18 @@ phase_12() {
         echo -e "  ${BOLD}Create password for ${GREEN}$INPUT_USERNAME${NC}${BOLD}:${NC}"
         echo ""
         adduser --gecos "" "$INPUT_USERNAME"
+
+        echo ""
+        echo "🔐 Setting password for $INPUT_USERNAME"
+
+        set_user_password "$INPUT_USERNAME"
     fi
 
+    if ! passwd -S "$INPUT_USERNAME" >/dev/null 2>&1; then
+    log_error "Password not set or user invalid — aborting Phase 12"
+    exit 1
+    fi
+    
     echo ""
     run_silent "Adding $INPUT_USERNAME to sudo + adm" bash -c "
         usermod -aG sudo $INPUT_USERNAME
