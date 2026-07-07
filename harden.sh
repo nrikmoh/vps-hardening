@@ -863,30 +863,56 @@ done
 # ---------------------------------------------------------------------------
 # Timezone
 # ---------------------------------------------------------------------------
+
+is_valid_timezone() {
+    [[ -e "/usr/share/zoneinfo/$1" ]]
+}
+
 print_divider
 echo -e "  ${BOLD}🕐 Timezone${NC}"
-CURRENT_TZ=$(timedatectl show --property=Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo "UTC")
-echo -e "  ${DIM}Current: ${CURRENT_TZ}${NC}"
-echo -e "  ${DIM}Examples: UTC  America/New_York  Europe/London  Asia/Tokyo${NC}"
-echo ""
-read -rp "  Timezone [${CURRENT_TZ}]: " INPUT_TZ
-INPUT_TZ="${INPUT_TZ:-$CURRENT_TZ}"
-    while true; do
-    # remove accidental spaces
-    INPUT_TZ="${INPUT_TZ//[[:space:]]/}"
 
-    if timedatectl list-timezones 2>/dev/null | grep -Fxq "$INPUT_TZ"; then
+# Detect current timezone
+CURRENT_TZ=""
+
+if command -v timedatectl >/dev/null 2>&1; then
+    CURRENT_TZ="$(timedatectl show --property=Timezone --value 2>/dev/null)"
+fi
+
+if [[ -z "$CURRENT_TZ" && -f /etc/timezone ]]; then
+    CURRENT_TZ="$(< /etc/timezone)"
+fi
+
+CURRENT_TZ="${CURRENT_TZ:-UTC}"
+
+echo -e "  ${DIM}Current: ${CURRENT_TZ}${NC}"
+echo -e "  ${DIM}Examples: UTC  Europe/Berlin  Europe/London  America/New_York  Asia/Tokyo${NC}"
+echo ""
+
+while true; do
+    read -rp "  Timezone [${CURRENT_TZ}]: " INPUT_TZ
+
+    # Keep current timezone if user presses Enter
+    INPUT_TZ="${INPUT_TZ:-$CURRENT_TZ}"
+
+    # Trim leading/trailing whitespace
+    INPUT_TZ="$(echo "$INPUT_TZ" | xargs)"
+
+    if is_valid_timezone "$INPUT_TZ"; then
         break
     fi
 
     log_warn "'$INPUT_TZ' is not a valid timezone."
 
-    echo "👉 Examples: Europe/Paris, Europe/Berlin, UTC"
-    echo "👉 Press Enter to keep: $CURRENT_TZ"
+    echo "👉 Please enter a valid IANA timezone."
+    echo "👉 Examples:"
+    echo "     UTC"
+    echo "     Europe/Berlin"
+    echo "     Europe/London"
+    echo "     America/New_York"
+    echo "     Asia/Tokyo"
+    echo ""
+done
 
-    read -rp "  Timezone [${CURRENT_TZ}]: " INPUT_TZ
-    INPUT_TZ="${INPUT_TZ:-$CURRENT_TZ}"
-    done
 log_ok "Timezone: $INPUT_TZ"
 
 # ---------------------------------------------------------------------------
