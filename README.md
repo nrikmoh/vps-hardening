@@ -7,4 +7,4 @@ curl -O https://raw.githubusercontent.com/nrikmoh/vps-hardening/main/harden.sh
 
 sudo chmod +x harden.sh
 
-sudo ./harden.sh
+sudo bash harden.sh
