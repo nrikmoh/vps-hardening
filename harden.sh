@@ -1988,25 +1988,32 @@ EOF
 # Optional tools: rkhunter, chkrootkit, clamav, aide
 _install_optional_tools() {
 
+    # -----------------------------------------------------------------------
+    # rkhunter + chkrootkit
+    # -----------------------------------------------------------------------
     if [[ "$ENABLE_RKHUNTER" == "true" ]]; then
         log_step "Installing rkhunter + chkrootkit"
+
         policy_block_start
+
         run_silent "Installing rkhunter + chkrootkit" \
-            bash -c 'DEBIAN_FRONTEND=noninteractive \
-                apt-get install -y -qq rkhunter chkrootkit'
+            bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq rkhunter chkrootkit'
+
         policy_allow_start
 
         run_silent "Updating rkhunter database" \
-            bash -c 'rkhunter --update > /dev/null 2>&1 || true'
-        run_silent "Setting rkhunter baseline" \
-            bash -c 'rkhunter --propupd > /dev/null 2>&1 || true'
+            bash -c 'rkhunter --update >/dev/null 2>&1 || logger -t rkhunter "Unable to update database"'
 
-        cat > /etc/cron.daily/vps-rkhunter << 'EOF'
+        run_silent "Creating rkhunter baseline" \
+            bash -c 'rkhunter --propupd >/dev/null 2>&1 || true'
+
+        cat > /etc/cron.daily/vps-rkhunter <<'EOF'
 #!/bin/bash
 rkhunter --check --skip-keypress --report-warnings-only \
-    --logfile /var/log/vps-hardening/rkhunter.log 2>/dev/null || true
+    --logfile /var/log/vps-hardening/rkhunter.log >/dev/null 2>&1 || true
 EOF
-        cat > /etc/cron.daily/vps-chkrootkit << 'EOF'
+
+        cat > /etc/cron.daily/vps-chkrootkit <<'EOF'
 #!/bin/bash
 chkrootkit 2>/dev/null \
     | grep -v "not infected" \
@@ -2014,28 +2021,51 @@ chkrootkit 2>/dev/null \
     | grep -v "^$" \
     >> /var/log/vps-hardening/chkrootkit.log || true
 EOF
-        chmod +x /etc/cron.daily/vps-rkhunter /etc/cron.daily/vps-chkrootkit
+
+        chmod +x /etc/cron.daily/vps-rkhunter
+        chmod +x /etc/cron.daily/vps-chkrootkit
+
         log_ok "rkhunter + chkrootkit installed (daily scans)"
     fi
 
+    # -----------------------------------------------------------------------
+    # ClamAV
+    # -----------------------------------------------------------------------
     if [[ "$ENABLE_CLAMAV" == "true" ]]; then
+
         log_step "Installing ClamAV"
+
         policy_block_start
+
         run_silent "Installing ClamAV" \
-            bash -c 'DEBIAN_FRONTEND=noninteractive \
-                apt-get install -y -qq clamav clamav-daemon'
+            bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq clamav clamav-daemon'
+
         policy_allow_start
 
         run_silent "Updating ClamAV signatures" \
-            bash -c 'systemctl stop clamav-freshclam 2>/dev/null || true
-                     freshclam > /dev/null 2>&1 || true
-                     systemctl start clamav-freshclam 2>/dev/null || true'
+            bash -c '
+                if systemctl list-unit-files | grep -q "^clamav-freshclam"; then
+                    systemctl stop clamav-freshclam 2>/dev/null || true
+                elif systemctl list-unit-files | grep -q "^freshclam"; then
+                    systemctl stop freshclam 2>/dev/null || true
+                fi
 
-        cat > /etc/cron.daily/vps-clamav << 'EOF'
+                freshclam >/dev/null 2>&1 || true
+
+                if systemctl list-unit-files | grep -q "^clamav-freshclam"; then
+                    systemctl start clamav-freshclam 2>/dev/null || true
+                elif systemctl list-unit-files | grep -q "^freshclam"; then
+                    systemctl start freshclam 2>/dev/null || true
+                fi
+            '
+
+        cat >/etc/cron.daily/vps-clamav <<'EOF'
 #!/bin/bash
+
 LOGFILE="/var/log/vps-hardening/clamav.log"
-DATE=$(date '+%Y-%m-%d %H:%M')
-echo "=== Scan: $DATE ===" >> "$LOGFILE"
+
+echo "=== Scan $(date '+%Y-%m-%d %H:%M') ===" >> "$LOGFILE"
+
 clamscan -r \
     --exclude-dir=/proc \
     --exclude-dir=/sys \
@@ -2044,37 +2074,118 @@ clamscan -r \
     --infected \
     --quiet \
     / >> "$LOGFILE" 2>&1
+
 if grep -q "FOUND" "$LOGFILE"; then
     logger -t clamav -p auth.alert \
-        "MALWARE DETECTED — check $LOGFILE"
+        "MALWARE DETECTED - check $LOGFILE"
 fi
 EOF
+
         chmod +x /etc/cron.daily/vps-clamav
+
         log_ok "ClamAV installed (daily scan)"
     fi
 
+    # -----------------------------------------------------------------------
+    # AIDE
+    # -----------------------------------------------------------------------
     if [[ "$ENABLE_AIDE" == "true" ]]; then
+
         log_step "Installing AIDE (full filesystem integrity)"
-        log_info "This takes 5–10 minutes for initial baseline..."
+        log_info "This takes 5–10 minutes for the initial baseline..."
+
         policy_block_start
+
         run_silent "Installing AIDE" \
-            bash -c 'DEBIAN_FRONTEND=noninteractive \
-                apt-get install -y -qq aide'
+            bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq aide'
+
         policy_allow_start
 
-        run_silent "Building AIDE baseline (be patient)" \
-            bash -c 'aideinit > /dev/null 2>&1 || true'
-        run_silent "Installing AIDE database" \
-            bash -c 'mv /var/lib/aide/aide.db.new \
-                /var/lib/aide/aide.db 2>/dev/null || true'
+        # Locate configuration
+        AIDE_CONF=""
 
-        cat > /etc/cron.daily/vps-aide << 'EOF'
+        for conf in \
+            /etc/aide/aide.conf \
+            /etc/aide.conf
+        do
+            if [[ -f "$conf" ]]; then
+                AIDE_CONF="$conf"
+                break
+            fi
+        done
+
+        if [[ -z "$AIDE_CONF" ]]; then
+
+            log_warn "AIDE configuration not found. Skipping setup."
+
+        else
+
+            run_silent "Building AIDE baseline (be patient)" \
+                bash -c "
+                    if command -v aideinit >/dev/null 2>&1; then
+                        aideinit >/dev/null 2>&1 || exit 1
+                    else
+                        aide --config=\"$AIDE_CONF\" --init >/dev/null 2>&1 || exit 1
+                    fi
+                "
+
+            run_silent "Installing AIDE database" \
+                bash -c '
+                    NEW_DB=$(find /var/lib/aide \
+                        -maxdepth 1 \
+                        -type f \
+                        -name "aide.db.new*" \
+                        | sort \
+                        | head -n1)
+
+                    if [[ -n "$NEW_DB" ]]; then
+                        mv "$NEW_DB" "${NEW_DB/.new/}"
+                    else
+                        exit 1
+                    fi
+                '
+
+            if compgen -G "/var/lib/aide/aide.db*" >/dev/null; then
+
+                log_ok "AIDE baseline created"
+
+                cat >/etc/cron.daily/vps-aide <<'EOF'
 #!/bin/bash
-aide --check >> /var/log/vps-hardening/aide.log 2>&1 || \
-    logger -t aide -p auth.alert "AIDE: Changes detected — check log"
+
+CONF=""
+
+for f in \
+    /etc/aide/aide.conf \
+    /etc/aide.conf
+do
+    [[ -f "$f" ]] && {
+        CONF="$f"
+        break
+    }
+done
+
+[[ -z "$CONF" ]] && exit 0
+
+aide --config="$CONF" --check \
+    >> /var/log/vps-hardening/aide.log 2>&1
+
+if [[ $? -ne 0 ]]; then
+    logger -t aide -p auth.alert \
+        "AIDE: filesystem changes detected - check aide.log"
+fi
 EOF
-        chmod +x /etc/cron.daily/vps-aide
-        log_ok "AIDE installed (daily full-system integrity check)"
+
+                chmod +x /etc/cron.daily/vps-aide
+
+                log_ok "AIDE installed (daily integrity monitoring)"
+
+            else
+
+                log_warn "AIDE baseline was not created. Daily checks disabled."
+
+            fi
+
+        fi
     fi
 }
 
