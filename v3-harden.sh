@@ -18,9 +18,9 @@
 #   Documentation: See README.md
 #
 #   Usage:
-#     sudo bash harden.sh                    # Interactive mode
-#     sudo DEBUG=1 bash harden.sh            # Verbose debug output
-#     sudo bash harden.sh --version          # Show version
+#     sudo bash v3-harden.sh                    # Interactive mode
+#     sudo DEBUG=1 bash v3-harden.sh            # Verbose debug output
+#     sudo bash v3-harden.sh --version          # Show version
 #
 ################################################################################
 
