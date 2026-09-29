@@ -114,10 +114,10 @@ HOSTNAME_FQDN="$(hostname -f 2>/dev/null || hostname)"
 PRIMARY_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 
 # Feature tracking
-declare -A COMPLETED_TASKS
-declare -A FAILED_TASKS
-declare -A SKIPPED_TASKS
-declare -A TASK_DURATIONS
+declare -A COMPLETED_TASKS=()
+declare -A FAILED_TASKS=()
+declare -A SKIPPED_TASKS=()
+declare -A TASK_DURATIONS=()
 
 # Counters
 TOTAL_WARNINGS=0
@@ -890,7 +890,7 @@ backup_critical_configs() {
     for item in "${critical_files[@]}"; do
         if [ -e "$item" ]; then
             backup_file "$item" "pre-hardening"
-            ((backed_up++))
+            backed_up=$((backed_up + 1))
         fi
     done
     
@@ -954,7 +954,13 @@ mark_skipped() {
 
 is_completed() {
     local task="$1"
-    [ -n "${COMPLETED_TASKS[$task]:-}" ] || [ -n "$(load_state "COMPLETED_${task}")" ]
+    set +u
+    local res="false"
+    if [ -n "${COMPLETED_TASKS[$task]:-}" ] || [ -n "$(load_state "COMPLETED_${task}")" ]; then
+        res="true"
+    fi
+    set -u
+    [ "$res" = "true" ]
 }
 
 start_task_timer() {
@@ -975,6 +981,8 @@ cleanup_on_exit() {
     
     release_lock
     
+    # Temporarily disable nounset to handle uninitialized/empty arrays safely
+    set +u
     {
         echo ""
         echo "################################################################"
@@ -1002,6 +1010,7 @@ cleanup_on_exit() {
         echo -e "    ${CYAN}cp -rp ${BACKUP_DIR}/etc/sysctl.d/* /etc/sysctl.d/${NC}"
         echo ""
     fi
+    set -u
     
     echo -e "${NC}"
 }
@@ -1156,10 +1165,10 @@ system_update() {
     for pkg in "${essential_packages[@]}"; do
         if ! package_installed "$pkg"; then
             if apt-get install -y "$pkg" >> "$LOG_FILE" 2>&1; then
-                ((installed_count++))
+                installed_count=$((installed_count + 1))
                 print_debug "Installed: ${pkg}"
             else
-                ((failed_count++))
+                failed_count=$((failed_count + 1))
                 print_warning "Failed to install: $pkg"
             fi
         else
@@ -5491,6 +5500,7 @@ telegram_bot_manage() {
 # Purpose: Display a comprehensive real-time security status overview
 # ----------------------------------------------------------------------------
 show_security_status() {
+    set +u  # Prevent unbound variable errors on empty arrays
     print_section "CURRENT SECURITY STATUS DASHBOARD"
 
     # ---- System Information ----
@@ -5775,7 +5785,6 @@ show_security_status() {
         print_key_value "Root Login Attempts" "$root_attempts" "$([ "$root_attempts" -gt 0 ] && echo "$RED" || echo "$GREEN")"
         print_key_value "Invalid User Attempts" "$invalid_users" "$([ "$invalid_users" -gt 5 ] && echo "$YELLOW" || echo "$GREEN")"
 
-        # Top attacking IPs
         if [ "$failed_today" -gt 0 ]; then
             echo ""
             echo -e "    ${BOLD}Top Attacking IPs (today):${NC}"
@@ -5846,6 +5855,7 @@ show_security_status() {
     echo -e "  ${DIM}Log file: ${LOG_FILE}${NC}"
     echo -e "  ${DIM}Backups:  ${BACKUP_DIR}${NC}"
     echo ""
+    set -u  # Restore nounset
 }
 
 # ============================================================================
@@ -5865,6 +5875,7 @@ generate_report() {
     local minutes=$(( total_duration / 60 ))
     local seconds=$(( total_duration % 60 ))
 
+    set +u  # Prevent unbound array checks under empty parameters
     {
         echo "================================================================"
         echo "  VPS HARDENING SESSION REPORT"
@@ -5950,7 +5961,7 @@ generate_report() {
         echo "  1. Test SSH login in a NEW terminal before closing this session"
         echo "  2. Run 'lynis audit system' for a full CIS benchmark audit"
         echo "  3. Set up Telegram bot notifications (menu option 40)"
-        echo "  4. Take a VPS snapshot via your hosting provider"
+        echo "  4. Take a VPS snapshot via your hosting provider's dashboard"
         echo "  5. Schedule a reboot to apply all kernel changes"
         echo "  6. Review this report and the log file for any issues"
         echo ""
@@ -5958,11 +5969,11 @@ generate_report() {
         echo "  End of Report"
         echo "================================================================"
     } > "$REPORT_FILE"
+    set -u
 
     chmod 600 "$REPORT_FILE"
     chown root:root "$REPORT_FILE"
     print_status "Report saved to: ${REPORT_FILE}"
-    print_info "Report size: $(du -h "$REPORT_FILE" | awk '{print $1}')"
 }
 
 # ============================================================================
@@ -5975,19 +5986,9 @@ generate_report() {
 # ----------------------------------------------------------------------------
 run_tier0_essential() {
     print_section "BATCH: TIER 0 ESSENTIAL HARDENING"
-    print_info "This will execute the following 7 tasks in sequence:"
-    echo -e "    ${CYAN}1.${NC} System Update & Cleanup"
-    echo -e "    ${CYAN}2.${NC} SSH Hardening"
-    echo -e "    ${CYAN}3.${NC} Firewall Configuration (UFW)"
-    echo -e "    ${CYAN}4.${NC} Fail2ban Setup"
-    echo -e "    ${CYAN}5.${NC} Kernel Hardening (sysctl)"
-    echo -e "    ${CYAN}6.${NC} Automatic Security Updates"
-    echo -e "    ${CYAN}7.${NC} User Account & Sudo Setup"
+    print_info "This will execute 7 tasks in sequence."
     echo ""
-    print_warning "Each task will still prompt for interactive input where needed."
-    print_warning "Estimated time: 10-20 minutes"
-    echo ""
-
+    
     if ! confirm "Proceed with Tier 0 batch execution?"; then
         print_info "Batch operation cancelled"
         return 0
@@ -5996,47 +5997,34 @@ run_tier0_essential() {
     local task_num=0
     local total_tasks=7
 
-    ((task_num++)); print_progress $task_num $total_tasks "System Update"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "System Update"
     system_update
 
-    ((task_num++)); print_progress $task_num $total_tasks "SSH Hardening"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "SSH Hardening"
     harden_ssh
 
-    ((task_num++)); print_progress $task_num $total_tasks "Firewall"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Firewall"
     configure_firewall
 
-    ((task_num++)); print_progress $task_num $total_tasks "Fail2ban"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Fail2ban"
     setup_fail2ban
 
-    ((task_num++)); print_progress $task_num $total_tasks "Kernel"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Kernel"
     kernel_hardening
 
-    ((task_num++)); print_progress $task_num $total_tasks "Auto-Updates"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Auto-Updates"
     setup_auto_updates
 
-    ((task_num++)); print_progress $task_num $total_tasks "User Setup"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "User Setup"
     setup_user_account
 
     echo ""
     print_success_box "TIER 0 ESSENTIAL HARDENING COMPLETE"
-    print_info "Completed: ${#COMPLETED_TASKS[@]} tasks | Failed: ${#FAILED_TASKS[@]} tasks"
 }
 
-# ----------------------------------------------------------------------------
-# Function: run_tier0_plus_tier1
-# Purpose: Execute Tier 0 + Tier 1 hardening tasks in sequence
-# ----------------------------------------------------------------------------
 run_tier0_plus_tier1() {
     print_section "BATCH: TIER 0 + TIER 1 HARDENING"
     print_info "This will execute 13 hardening tasks across Tier 0 and Tier 1."
-    echo ""
-    echo -e "  ${GREEN}${BOLD}Tier 0 (Essential):${NC}"
-    echo -e "    System Update, SSH, Firewall, Fail2ban, Kernel, Auto-Updates, User Setup"
-    echo ""
-    echo -e "  ${YELLOW}${BOLD}Tier 1 (High Impact):${NC}"
-    echo -e "    /dev/shm, Protocols, AppArmor, AIDE, Auditd, /tmp"
-    echo ""
-    print_warning "Estimated time: 20-35 minutes (AIDE init takes longest)"
     echo ""
 
     if ! confirm "Proceed with Tier 0+1 batch execution?"; then
@@ -6047,66 +6035,52 @@ run_tier0_plus_tier1() {
     local task_num=0
     local total_tasks=13
 
-    # Tier 0
-    ((task_num++)); print_progress $task_num $total_tasks "System Update"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "System Update"
     system_update
 
-    ((task_num++)); print_progress $task_num $total_tasks "SSH"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "SSH"
     harden_ssh
 
-    ((task_num++)); print_progress $task_num $total_tasks "Firewall"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Firewall"
     configure_firewall
 
-    ((task_num++)); print_progress $task_num $total_tasks "Fail2ban"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Fail2ban"
     setup_fail2ban
 
-    ((task_num++)); print_progress $task_num $total_tasks "Kernel"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Kernel"
     kernel_hardening
 
-    ((task_num++)); print_progress $task_num $total_tasks "Auto-Updates"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Auto-Updates"
     setup_auto_updates
 
-    ((task_num++)); print_progress $task_num $total_tasks "User Setup"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "User Setup"
     setup_user_account
 
-    # Tier 1
-    ((task_num++)); print_progress $task_num $total_tasks "/dev/shm"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "/dev/shm"
     secure_shared_memory
 
-    ((task_num++)); print_progress $task_num $total_tasks "Protocols"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Protocols"
     disable_unused_protocols
 
-    ((task_num++)); print_progress $task_num $total_tasks "AppArmor"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "AppArmor"
     setup_apparmor
 
-    ((task_num++)); print_progress $task_num $total_tasks "AIDE"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "AIDE"
     setup_aide
 
-    ((task_num++)); print_progress $task_num $total_tasks "Auditd"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Auditd"
     setup_auditd
 
-    ((task_num++)); print_progress $task_num $total_tasks "/tmp"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "/tmp"
     secure_tmp_directories
 
     echo ""
     print_success_box "TIER 0 + TIER 1 HARDENING COMPLETE"
-    print_info "Completed: ${#COMPLETED_TASKS[@]} tasks | Failed: ${#FAILED_TASKS[@]} tasks"
 }
 
-# ----------------------------------------------------------------------------
-# Function: run_full_hardening
-# Purpose: Execute all Tier 0, 1, and 2 hardening tasks
-# ----------------------------------------------------------------------------
 run_full_hardening() {
     print_section "BATCH: FULL HARDENING (TIER 0 + 1 + 2)"
     print_info "This will execute 22 hardening tasks across all three tiers."
-    echo ""
-    echo -e "  ${GREEN}${BOLD}Tier 0 (Essential):${NC}      7 tasks"
-    echo -e "  ${YELLOW}${BOLD}Tier 1 (High Impact):${NC}    6 tasks"
-    echo -e "  ${MAGENTA}${BOLD}Tier 2 (Advanced):${NC}       9 tasks"
-    echo ""
-    print_warning "Estimated time: 30-50 minutes"
-    print_warning "This is a comprehensive hardening pass. Some services may be disrupted."
     echo ""
 
     if ! confirm "Proceed with FULL batch execution?"; then
@@ -6117,84 +6091,80 @@ run_full_hardening() {
     local task_num=0
     local total_tasks=22
 
-    # Tier 0
-    ((task_num++)); print_progress $task_num $total_tasks "System Update"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "System Update"
     system_update
 
-    ((task_num++)); print_progress $task_num $total_tasks "SSH"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "SSH"
     harden_ssh
 
-    ((task_num++)); print_progress $task_num $total_tasks "Firewall"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Firewall"
     configure_firewall
 
-    ((task_num++)); print_progress $task_num $total_tasks "Fail2ban"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Fail2ban"
     setup_fail2ban
 
-    ((task_num++)); print_progress $task_num $total_tasks "Kernel"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Kernel"
     kernel_hardening
 
-    ((task_num++)); print_progress $task_num $total_tasks "Auto-Updates"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Auto-Updates"
     setup_auto_updates
 
-    ((task_num++)); print_progress $task_num $total_tasks "User Setup"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "User Setup"
     setup_user_account
 
-    # Tier 1
-    ((task_num++)); print_progress $task_num $total_tasks "/dev/shm"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "/dev/shm"
     secure_shared_memory
 
-    ((task_num++)); print_progress $task_num $total_tasks "Protocols"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Protocols"
     disable_unused_protocols
 
-    ((task_num++)); print_progress $task_num $total_tasks "AppArmor"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "AppArmor"
     setup_apparmor
 
-    ((task_num++)); print_progress $task_num $total_tasks "AIDE"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "AIDE"
     setup_aide
 
-    ((task_num++)); print_progress $task_num $total_tasks "Auditd"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Auditd"
     setup_auditd
 
-    ((task_num++)); print_progress $task_num $total_tasks "/tmp"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "/tmp"
     secure_tmp_directories
 
-    # Tier 2
-    ((task_num++)); print_progress $task_num $total_tasks "Resource Limits"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Resource Limits"
     setup_resource_limits
 
-    ((task_num++)); print_progress $task_num $total_tasks "Services"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Services"
     disable_unnecessary_services
 
-    ((task_num++)); print_progress $task_num $total_tasks "Cron/At"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Cron/At"
     restrict_cron_at
 
-    ((task_num++)); print_progress $task_num $total_tasks "DNS over TLS"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "DNS over TLS"
     setup_dns_over_tls
 
-    ((task_num++)); print_progress $task_num $total_tasks "Login Security"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Login Security"
     setup_login_security
 
-    ((task_num++)); print_progress $task_num $total_tasks "User Hardening"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "User Hardening"
     setup_user_hardening
 
-    ((task_num++)); print_progress $task_num $total_tasks "Lynis"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Lynis"
     install_lynis
 
-    ((task_num++)); print_progress $task_num $total_tasks "Log Forwarding"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Log Forwarding"
     setup_log_forwarding
 
-    ((task_num++)); print_progress $task_num $total_tasks "Kernel Lockdown"
+    task_num=$((task_num + 1)); print_progress $task_num $total_tasks "Kernel Lockdown"
     setup_kernel_lockdown
 
     echo ""
     print_success_box "FULL HARDENING (TIER 0+1+2) COMPLETE"
-    print_info "Completed: ${#COMPLETED_TASKS[@]} tasks | Failed: ${#FAILED_TASKS[@]} tasks"
-    echo ""
-    print_info "For Zero Trust networking, run options 23 (Tailscale) or 24 (fwknop) separately."
-    print_info "For Telegram bot, run option 40 separately."
 }
-
 # End of Section 9
+# ============================================================================
+# INTERACTIVE MENU SYSTEM
+# ============================================================================
+
 # ============================================================================
 # INTERACTIVE MENU SYSTEM
 # ============================================================================
@@ -6486,16 +6456,19 @@ main() {
                 local seconds=$(( total_duration % 60 ))
 
                 echo ""
-                print_double_separator
+                print_thick_separator
                 echo -e "  ${BOLD}Session Summary:${NC}"
                 echo -e "    ${BOLD}Duration:${NC}       ${minutes}m ${seconds}s"
+                
+                # Wrap arrays in set +u to prevent crash on exit
+                set +u
                 echo -e "    ${BOLD}Completed:${NC}      ${GREEN}${#COMPLETED_TASKS[@]} tasks${NC}"
                 echo -e "    ${BOLD}Failed:${NC}         ${RED}${#FAILED_TASKS[@]} tasks${NC}"
                 echo -e "    ${BOLD}Skipped:${NC}        ${YELLOW}${#SKIPPED_TASKS[@]} tasks${NC}"
                 echo -e "    ${BOLD}Warnings:${NC}       ${TOTAL_WARNINGS}"
                 echo -e "    ${BOLD}Errors:${NC}         ${TOTAL_ERRORS}"
                 echo -e "    ${BOLD}Total Actions:${NC}  ${TOTAL_ACTIONS}"
-                print_double_separator
+                print_thick_separator
                 echo ""
 
                 # Completed tasks list
@@ -6517,6 +6490,7 @@ main() {
                     done
                     echo ""
                 fi
+                set -u
 
                 # File locations
                 print_info "Session files:"
