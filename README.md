@@ -5,6 +5,6 @@ Run the command below on Linux:
 
 curl -O https://raw.githubusercontent.com/nrikmoh/vps-hardening/main/v3-harden.sh
 
-sudo chmod +x harden.sh
+sudo chmod +x v3-harden.sh
 
-sudo bash harden.sh
+sudo bash v3-harden.sh
