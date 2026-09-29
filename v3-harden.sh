@@ -5768,40 +5768,52 @@ show_security_status() {
     print_key_value "Total Listening Ports" "$total_ports"
     echo ""
 
-       # ---- Authentication Activity ----
+         # ---- Authentication Activity ----
     print_subsection "Recent Authentication Activity"
-    
+
     local today_date
     today_date="$(date '+%b %e')"
     local today_iso
     today_iso="$(date '+%Y-%m-%d')"
 
+    local failed_today=0
+    local success_today=0
+    local root_attempts=0
+    local invalid_users=0
+
     if [ -f /var/log/auth.log ]; then
-        local failed_today
-        local success_today
-        local root_attempts
-        local invalid_users
+        # Run subshells safely with explicit 0 fallback to prevent pipefail errors
+        failed_today=$( (grep "Failed password" /var/log/auth.log 2>/dev/null | grep -E "${today_date}|${today_iso}" | awk 'END {print NR}') || echo "0" )
+        success_today=$( (grep -E "Accepted (publickey|password)" /var/log/auth.log 2>/dev/null | grep -E "${today_date}|${today_iso}" | awk 'END {print NR}') || echo "0" )
+        root_attempts=$( (grep "Failed password.*root" /var/log/auth.log 2>/dev/null | grep -E "${today_date}|${today_iso}" | awk 'END {print NR}') || echo "0" )
+        invalid_users=$( (grep "Invalid user" /var/log/auth.log 2>/dev/null | grep -E "${today_date}|${today_iso}" | awk 'END {print NR}') || echo "0" )
 
-        # Use awk to guarantee a clean single integer output even under set -o pipefail
-        failed_today=$(grep "Failed password" /var/log/auth.log 2>/dev/null | grep -E "$today_date|$today_iso" | awk 'END {print NR}')
-        success_today=$(grep -E "Accepted (publickey|password)" /var/log/auth.log 2>/dev/null | grep -E "$today_date|$today_iso" | awk 'END {print NR}')
-        root_attempts=$(grep "Failed password.*root" /var/log/auth.log 2>/dev/null | grep -E "$today_date|$today_iso" | awk 'END {print NR}')
-        invalid_users=$(grep "Invalid user" /var/log/auth.log 2>/dev/null | grep -E "$today_date|$today_iso" | awk 'END {print NR}')
+        # Strip any accidental non-digit characters
+        failed_today=$(echo "$failed_today" | tr -cd '0-9')
+        success_today=$(echo "$success_today" | tr -cd '0-9')
+        root_attempts=$(echo "$root_attempts" | tr -cd '0-9')
+        invalid_users=$(echo "$invalid_users" | tr -cd '0-9')
 
-        # Sanitize variables (ensure they are always numbers, default to 0)
         failed_today=${failed_today:-0}
         success_today=${success_today:-0}
         root_attempts=${root_attempts:-0}
         invalid_users=${invalid_users:-0}
 
+        # Safe if-else color selection (prevents set -e termination)
         local failed_color="$GREEN"
-        [ "$failed_today" -gt 10 ] && failed_color="$RED"
+        if [ "$failed_today" -gt 10 ]; then
+            failed_color="$RED"
+        fi
 
         local root_color="$GREEN"
-        [ "$root_attempts" -gt 0 ] && root_color="$RED"
+        if [ "$root_attempts" -gt 0 ]; then
+            root_color="$RED"
+        fi
 
         local invalid_color="$GREEN"
-        [ "$invalid_users" -gt 5 ] && invalid_color="$YELLOW"
+        if [ "$invalid_users" -gt 5 ]; then
+            invalid_color="$YELLOW"
+        fi
 
         print_key_value "Failed Logins (today)" "$failed_today" "$failed_color"
         print_key_value "Successful Logins (today)" "$success_today" "$GREEN"
@@ -5811,16 +5823,21 @@ show_security_status() {
         if [ "$failed_today" -gt 0 ]; then
             echo ""
             echo -e "    ${BOLD}Top Attacking IPs (today):${NC}"
-            grep "Failed password" /var/log/auth.log 2>/dev/null | grep -E "$today_date|$today_iso" | \
-                grep -oP 'from \K[0-9.]+' | sort | uniq -c | sort -rn | head -5 | \
+            (grep "Failed password" /var/log/auth.log 2>/dev/null | grep -E "${today_date}|${today_iso}" | \
+                grep -oP 'from \K[0-9.]+' | sort | uniq -c | sort -rn | head -5 || true) | \
                 while read -r count ip; do
-                    [ -n "$ip" ] && echo -e "      ${RED}• ${ip}${NC} (${count} attempts)"
+                    if [ -n "${ip:-}" ]; then
+                        echo -e "      ${RED}• ${ip}${NC} (${count} attempts)"
+                    fi
                 done
         fi
     else
         print_info "Auth log not available (systemd journal in use)"
-        local journal_failed
-        journal_failed=$(journalctl -u ssh -u sshd --since today 2>/dev/null | grep "Failed password" | awk 'END {print NR}')
+        local journal_failed=0
+        if command -v journalctl &>/dev/null; then
+            journal_failed=$( (journalctl -u ssh -u sshd --since today 2>/dev/null | grep "Failed password" | awk 'END {print NR}') || echo "0" )
+        fi
+        journal_failed=$(echo "$journal_failed" | tr -cd '0-9')
         journal_failed=${journal_failed:-0}
         print_key_value "Failed SSH Logins (today)" "$journal_failed"
     fi
