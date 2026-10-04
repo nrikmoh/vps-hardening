@@ -1139,45 +1139,80 @@ system_update() {
     print_status "System cleaned"
     print_info "APT cache: ${before_size} → ${after_size}"
     
-    # Install essential utilities
+       # -------------------------------------------------------------------------
+    # Essential Utility Installation (Fault-Tolerant)
+    # -------------------------------------------------------------------------
     print_subsection "Essential Utility Installation"
     print_step "Installing essential utility packages..."
-    
-    local essential_packages=(
-        curl wget git vim nano htop
-        net-tools dnsutils iproute2
-        gnupg2 ca-certificates
-        software-properties-common
-        apt-transport-https
-        unzip zip tar
-        rsync bc jq
-        python3 python3-minimal
-        lsof strace
-        tree tmux
-        logrotate
+
+    export DEBIAN_FRONTEND=noninteractive
+
+    # Core utilities list
+    local essential_pkgs=(
+        curl
+        wget
+        git
+        htop
+        iotop
+        iftop
+        lsof
+        tcpdump
+        unzip
+        zip
+        tar
+        ca-certificates
+        gnupg
+        lsb-release
+        cron
+        jq
+        bc
+        ufw
+        fail2ban
+        net-tools
+        dnsutils
+        sysstat
     )
-    
-    local installed_count=0
+
+    local to_install=()
     local skipped_count=0
-    local failed_count=0
-    local pkg
-    
-    for pkg in "${essential_packages[@]}"; do
-        if ! package_installed "$pkg"; then
-            if apt-get install -y "$pkg" >> "$LOG_FILE" 2>&1; then
-                installed_count=$((installed_count + 1))
-                print_debug "Installed: ${pkg}"
-            else
-                failed_count=$((failed_count + 1))
-                print_warning "Failed to install: $pkg"
-            fi
+    local installed_count=0
+
+    # Check which packages are missing (no pipes to prevent pipefail triggers)
+    for pkg in "${essential_pkgs[@]}"; do
+        if dpkg -s "$pkg" &>/dev/null; then
+            skipped_count=$((skipped_count + 1))
         else
-            ((skipped_count++))
-            print_debug "Already installed: ${pkg}"
+            to_install+=("$pkg")
         fi
     done
-    
-    print_status "Essential utilities: ${installed_count} installed, ${skipped_count} already present, ${failed_count} failed"
+
+    # Install missing packages safely
+    if [ ${#to_install[@]} -gt 0 ]; then
+        print_info "Packages to install: ${to_install[*]}"
+        if apt-get update -qq >> "$LOG_FILE" 2>&1 && \
+           apt-get install -y -qq \
+               -o Dpkg::Options::="--force-confdef" \
+               -o Dpkg::Options::="--force-confold" \
+               "${to_install[@]}" >> "$LOG_FILE" 2>&1; then
+            installed_count=${#to_install[@]}
+            print_status "Installed ${installed_count} packages successfully"
+        else
+            print_warning "Batch installation encountered warnings; installing packages individually..."
+            for pkg in "${to_install[@]}"; do
+                if apt-get install -y -qq \
+                    -o Dpkg::Options::="--force-confdef" \
+                    -o Dpkg::Options::="--force-confold" \
+                    "$pkg" >> "$LOG_FILE" 2>&1; then
+                    installed_count=$((installed_count + 1))
+                else
+                    print_warning "Skipped unavailable package: $pkg"
+                fi
+            done
+            print_status "Utility installation completed (${installed_count} installed)"
+        fi
+    else
+        print_status "All essential utilities are already installed"
+    fi
     
     # Check for reboot requirement
     if [ -f /var/run/reboot-required ]; then
