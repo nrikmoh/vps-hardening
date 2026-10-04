@@ -3250,8 +3250,9 @@ disable_unnecessary_services() {
     echo ""
     
     print_subsection "Active Listening Interfaces"
-    ss -tlnp 2>/dev/null | grep LISTEN | awk '{printf "    %-30s %s\n", $4, $6}' || \
-        print_warning "Failed to extract active listening interfaces"
+    if command -v ss &>/dev/null; then
+        ss -tlnp 2>/dev/null | grep LISTEN | awk '{printf "    %-30s %s\n", $4, $6}' || print_warning "Failed to extract active listening interfaces"
+    fi
     echo ""
     
     declare -A system_daemons
@@ -3295,8 +3296,10 @@ disable_unnecessary_services() {
         ["systemd-journal-upload"]="systemd log remote uploading daemon"
     )
     
-    local sorted_list
-    sorted_list=($(echo "${!system_daemons[@]}" | tr ' ' '\n' | sort))
+    local sorted_list=()
+    while IFS= read -r line; do
+        [ -n "$line" ] && sorted_list+=("$line")
+    done < <(printf '%s\n' "${!system_daemons[@]}" | sort)
     
     print_subsection "Daemon Services Verification"
     print_warning "Only turn off services you are positive are redundant."
@@ -3308,24 +3311,30 @@ disable_unnecessary_services() {
     for d_unit in "${sorted_list[@]}"; do
         local desc="${system_daemons[$d_unit]}"
         
-        if systemctl list-unit-files "${d_unit}.service" &>/dev/null 2>&1; then
+        if systemctl list-unit-files "${d_unit}*" &>/dev/null 2>&1; then
             local state
             state=$(systemctl is-enabled "$d_unit" 2>/dev/null || echo "not-found")
             local active
-            active=$(systemctl is-active "$d_unit" 2>/dev/null || echo "inactive")
+            active=$(systemctl is-active "$d_unit" 2>/dev/null | head -n 1 || echo "inactive")
+            active=${active:-inactive}
             
             if [ "$state" != "not-found" ] && [ "$state" != "masked" ]; then
                 local st_col="${GREEN}"
-                [ "$active" = "active" ] && st_col="${RED}"
+                if [ "$active" = "active" ]; then
+                    st_col="${RED}"
+                fi
                 
                 echo -e "  ${st_col}[${active}]${NC} ${BOLD}${d_unit}${NC} - ${desc}"
                 
                 if confirm "Disable and mask ${d_unit}?" "n"; then
-                    systemctl stop "$d_unit" 2>>"$LOG_FILE" || true
-                    systemctl disable "$d_unit" 2>>"$LOG_FILE" || true
-                    systemctl mask "$d_unit" 2>>"$LOG_FILE" || true
+                    systemctl stop "$d_unit" >> "$LOG_FILE" 2>&1 || true
+                    systemctl stop "${d_unit}.socket" >> "$LOG_FILE" 2>&1 || true
+                    systemctl disable "$d_unit" >> "$LOG_FILE" 2>&1 || true
+                    systemctl disable "${d_unit}.socket" >> "$LOG_FILE" 2>&1 || true
+                    systemctl mask "$d_unit" >> "$LOG_FILE" 2>&1 || true
+                    systemctl mask "${d_unit}.socket" >> "$LOG_FILE" 2>&1 || true
                     print_status "Deactivated and masked service: ${d_unit}"
-                    ((deactivated_ctr++))
+                    deactivated_ctr=$((deactivated_ctr + 1))
                 fi
             fi
         fi
@@ -3346,10 +3355,11 @@ disable_unnecessary_services() {
             sock_state=$(systemctl is-enabled "$d_sock" 2>/dev/null || echo "not-found")
             if [ "$sock_state" != "not-found" ] && [ "$sock_state" != "masked" ]; then
                 if confirm "Disable and mask ${d_sock}?" "n"; then
-                    systemctl stop "$d_sock" 2>/dev/null || true
-                    systemctl mask "$d_sock" 2>/dev/null || true
+                    systemctl stop "$d_sock" >> "$LOG_FILE" 2>&1 || true
+                    systemctl disable "$d_sock" >> "$LOG_FILE" 2>&1 || true
+                    systemctl mask "$d_sock" >> "$LOG_FILE" 2>&1 || true
                     print_status "Deactivated socket interface: ${d_sock}"
-                    ((deactivated_ctr++))
+                    deactivated_ctr=$((deactivated_ctr + 1))
                 fi
             fi
         fi
